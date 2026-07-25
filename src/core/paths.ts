@@ -2,18 +2,18 @@
 
 /** Per-OS application data directory. */
 export function defaultDataDir(): string {
-  const override = Deno.env.get("XTEINK_DATA_DIR");
+  const override = Deno.env.get("POCKET_DATA_DIR");
   if (override) return override;
 
   if (Deno.build.os === "windows") {
     const appData = Deno.env.get("APPDATA") ??
       `${Deno.env.get("USERPROFILE") ?? "."}/AppData/Roaming`;
-    return `${appData.replace(/\\/g, "/")}/xteink-sync`;
+    return `${appData.replace(/\\/g, "/")}/pocket-sync`;
   }
   const home = Deno.env.get("HOME") ?? ".";
-  if (Deno.build.os === "darwin") return `${home}/Library/Application Support/xteink-sync`;
+  if (Deno.build.os === "darwin") return `${home}/Library/Application Support/pocket-sync`;
   const xdg = Deno.env.get("XDG_DATA_HOME") || `${home}/.local/share`;
-  return `${xdg}/xteink-sync`;
+  return `${xdg}/pocket-sync`;
 }
 
 /** Directory containing the app source / bundle resources. */
@@ -38,7 +38,7 @@ export class Paths {
     return `${this.dataDir}/logs`;
   }
   get logFile() {
-    return `${this.logsDir}/xteink-sync.log`;
+    return `${this.logsDir}/pocket-sync.log`;
   }
   get tmpDir() {
     return `${this.dataDir}/tmp`;

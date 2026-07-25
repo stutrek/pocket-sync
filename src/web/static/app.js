@@ -1,4 +1,4 @@
-// Xteink Sync web UI — plain DOM, no build step, WebKit-safe.
+// Pocket Sync web UI — plain DOM, no build step, WebKit-safe.
 "use strict";
 
 const $ = (sel) => document.querySelector(sel);
@@ -661,7 +661,7 @@ function renderSettings() {
     ["check", "upload.webdavFallback", "WebDAV fallback if uploads fail"],
     ["h", "Behaviour"],
     ["check", "autoSyncEnabled", "Auto-sync on connect"],
-    ["check", "startAtLogin", "Start Xteink Sync at login"],
+    ["check", "startAtLogin", "Start Pocket Sync at login"],
     ["select", "logLevel", "Log level", ["debug", "info", "warn", "error"]],
   ];
 

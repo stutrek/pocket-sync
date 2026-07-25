@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Xteink Sync engine sidecar.
+"""Pocket Sync engine sidecar.
 
 Thin JSON-lines wrapper around the *unmodified* CrossPoint Calibre plugin
 modules vendored under ``engine/vendor/crosspoint_reader`` (see

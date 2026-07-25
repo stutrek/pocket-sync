@@ -72,7 +72,7 @@ export class App {
   }
 
   async start() {
-    this.log.info("app.start", `Xteink Sync starting (data dir ${this.paths.dataDir})`);
+    this.log.info("app.start", `Pocket Sync starting (data dir ${this.paths.dataDir})`);
     await this.sidecar.prepare();
     await this.checkDependencies();
     this.devices.start();
@@ -151,7 +151,7 @@ export class App {
   async stop() {
     this.devices.stop();
     await this.sidecar.stop();
-    this.log.info("app.stop", "Xteink Sync stopped");
+    this.log.info("app.stop", "Pocket Sync stopped");
     this.log.close();
     this.db.close();
   }

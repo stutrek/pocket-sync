@@ -7,13 +7,13 @@
  */
 import type { Logger } from "../core/log.ts";
 
-const LABEL = "com.xteink.sync";
+const LABEL = "com.pocket.sync";
 
 /** The command that launches this app again, as the OS should record it. */
 export function launchCommand(): string {
   const exe = Deno.execPath();
   if (Deno.build.os === "darwin") {
-    // …/XteinkSync.app/Contents/MacOS/<exe> — launch the bundle's executable.
+    // …/PocketSync.app/Contents/MacOS/<exe> — launch the bundle's executable.
     return exe;
   }
   return exe;
@@ -29,7 +29,7 @@ function plistPath(): string {
 
 function desktopPath(): string {
   const config = Deno.env.get("XDG_CONFIG_HOME") || `${home()}/.config`;
-  return `${config}/autostart/xteink-sync.desktop`;
+  return `${config}/autostart/pocket-sync.desktop`;
 }
 
 export async function isEnabled(): Promise<boolean> {
@@ -44,7 +44,7 @@ export async function isEnabled(): Promise<boolean> {
             "query",
             "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
             "/v",
-            "XteinkSync",
+            "PocketSync",
           ],
           stdout: "piped",
           stderr: "null",
@@ -100,8 +100,8 @@ async function macos(enabled: boolean, dataDir: string) {
   <key>ThrottleInterval</key><integer>10</integer>
   <key>ProcessType</key><string>Interactive</string>
   <key>EnvironmentVariables</key><dict>
-    <key>XTEINK_START_HIDDEN</key><string>1</string>
-    <key>XTEINK_DATA_DIR</key><string>${dataDir}</string>
+    <key>POCKET_START_HIDDEN</key><string>1</string>
+    <key>POCKET_DATA_DIR</key><string>${dataDir}</string>
   </dict>
   <key>StandardOutPath</key><string>${logs}/launchd.out.log</string>
   <key>StandardErrorPath</key><string>${logs}/launchd.err.log</string>
@@ -125,8 +125,8 @@ async function macos(enabled: boolean, dataDir: string) {
 async function windows(enabled: boolean) {
   const key = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run";
   const args = enabled
-    ? ["add", key, "/v", "XteinkSync", "/t", "REG_SZ", "/d", `"${launchCommand()}"`, "/f"]
-    : ["delete", key, "/v", "XteinkSync", "/f"];
+    ? ["add", key, "/v", "PocketSync", "/t", "REG_SZ", "/d", `"${launchCommand()}"`, "/f"]
+    : ["delete", key, "/v", "PocketSync", "/f"];
   const out = await new Deno.Command("reg", { args, stdout: "null", stderr: "piped" }).output();
   if (out.code !== 0 && enabled) {
     throw new Error(new TextDecoder().decode(out.stderr).trim() || `reg exited ${out.code}`);
@@ -144,9 +144,9 @@ async function linux(enabled: boolean, dataDir: string) {
     path,
     `[Desktop Entry]
 Type=Application
-Name=Xteink Sync
+Name=Pocket Sync
 Comment=Sync books to Xteink e-readers
-Exec=env XTEINK_START_HIDDEN=1 XTEINK_DATA_DIR="${dataDir}" "${launchCommand()}"
+Exec=env POCKET_START_HIDDEN=1 POCKET_DATA_DIR="${dataDir}" "${launchCommand()}"
 Terminal=false
 X-GNOME-Autostart-enabled=true
 `,

@@ -1,4 +1,4 @@
-# Xteink Sync
+# Pocket Sync
 
 A self-hosted book-sync daemon for **Xteink X3/X4** e-readers running **CrossInk / CrossPoint**
 firmware. It keeps a personal library and pushes books — resampled for the low-memory device — to
@@ -9,7 +9,7 @@ reuses the CrossPoint plugin's optimizer and protocol client verbatim (see
 [Vendored engine](#vendored-engine)).
 
 ```
-        ┌──────────────── XteinkSync.app (one Deno process) ───────────────┐
+        ┌──────────────── PocketSync.app (one Deno process) ───────────────┐
         │  menu-bar tray  ·  window  ·  HTTP + web UI  ·  SQLite           │
 browser ┤  library / lists / ingest  →  resample cache  →  sync engine     │
         │  device manager: UDP discovery, /api/*, WebSocket upload         │
@@ -25,21 +25,21 @@ carries its own Python runtime for the image resampler and unpacks it on first l
 
 | Platform              | Download                          | Notes                              |
 | --------------------- | --------------------------------- | ---------------------------------- |
-| macOS (Apple Silicon) | `XteinkSync-macos-arm64.dmg`      | Open, drag to Applications, launch |
-| macOS (Intel)         | `XteinkSync-macos-x64.dmg`        | Same                               |
-| Windows (x64)         | `XteinkSync-windows-x64.msi`      | Double-click to install            |
-| Linux (x64)           | `XteinkSync-linux-x64.AppImage`   | `chmod +x`, then run               |
-| Linux (arm64)         | `XteinkSync-linux-arm64.AppImage` | Same                               |
+| macOS (Apple Silicon) | `PocketSync-macos-arm64.dmg`      | Open, drag to Applications, launch |
+| macOS (Intel)         | `PocketSync-macos-x64.dmg`        | Same                               |
+| Windows (x64)         | `PocketSync-windows-x64.msi`      | Double-click to install            |
+| Linux (x64)           | `PocketSync-linux-x64.AppImage`   | `chmod +x`, then run               |
+| Linux (arm64)         | `PocketSync-linux-arm64.AppImage` | Same                               |
 
 The app lives in the menu bar / tray. Click it to open the library, or browse to
-<http://127.0.0.1:8787> from any browser on the machine. Turn on **Settings → Start Xteink Sync at
+<http://127.0.0.1:8787> from any browser on the machine. Turn on **Settings → Start Pocket Sync at
 login** to have it come back after a reboot.
 
 These builds are signed ad hoc, not with a paid developer certificate, so the OS will warn on first
 launch:
 
 - **macOS** — right-click the app and choose _Open_, or run
-  `xattr -dr com.apple.quarantine /Applications/XteinkSync.app`
+  `xattr -dr com.apple.quarantine /Applications/PocketSync.app`
 - **Windows** — SmartScreen: _More info_ → _Run anyway_
 
 **Calibre is optional.** EPUB files sync without it. Converting anything else (MOBI, AZW3, PDF,
@@ -79,7 +79,7 @@ Details worth knowing:
 - **Book identity on the device** is the filename `<bookId>__<title>.epub`, so a lost database can
   be reconstructed from the device listing alone. The local manifest is preferred; filenames are the
   fallback.
-- **`mirror` only deletes what Xteink Sync put there** — files it doesn't recognise are left alone
+- **`mirror` only deletes what Pocket Sync put there** — files it doesn't recognise are left alone
   and logged. Side-loaded books survive a mirror sync.
 - **Device identity** comes from a stable field in `/api/status` (`uuid`, `serial`, …) so DHCP can
   move the reader freely. If the firmware exposes nothing stable, the device is bound by address and
@@ -165,12 +165,12 @@ font-free and within the firmware's paragraph/file size limits.
 
 ## Data and configuration
 
-Everything lives in `~/Library/Application Support/xteink-sync/` (override with `XTEINK_DATA_DIR`):
+Everything lives in `~/Library/Application Support/pocket-sync/` (override with `POCKET_DATA_DIR`):
 
 ```
 db.sqlite                  library, lists, devices, rules, manifest
 library/<bookId>/          original.<ext>, book.epub, opt-<hash>.epub, cover.jpg
-logs/xteink-sync.log       rotating JSONL, mirrored to the UI and tray
+logs/pocket-sync.log       rotating JSONL, mirrored to the UI and tray
 config.json                paths, discovery, upload, log level
 engine/                    materialized sidecar + .venv
 ```
@@ -200,7 +200,7 @@ runtime.
 Building for a source checkout instead:
 
 - **Requirements**: Deno 2.9+ (for the `deno desktop` subcommand). Calibre optional, as above.
-- `deno task build` produces a plain `dist/XteinkSync.app` without the bundled runtime; use
+- `deno task build` produces a plain `dist/PocketSync.app` without the bundled runtime; use
   `deno task package` for anything you intend to hand to someone else.
 
 ## Licence

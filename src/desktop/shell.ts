@@ -29,7 +29,7 @@ export function startDesktopShell(
   if (!isDesktop()) return null;
 
   // The first construction adopts the implicit startup window.
-  let win = new D.BrowserWindow({ title: "Xteink Sync", width: 1180, height: 820 });
+  let win = new D.BrowserWindow({ title: "Pocket Sync", width: 1180, height: 820 });
   win.navigate(uiUrl);
   if (opts.startHidden) win.hide();
   if (opts.hideDock) {
@@ -48,7 +48,7 @@ export function startDesktopShell(
 
   const ensureWindow = () => {
     if (!win || win.isClosed()) {
-      win = new D.BrowserWindow({ title: "Xteink Sync", width: 1180, height: 820 });
+      win = new D.BrowserWindow({ title: "Pocket Sync", width: 1180, height: 820 });
     }
     return win;
   };
@@ -74,7 +74,7 @@ export function startDesktopShell(
 
   const buildMenu = () => {
     const s = app.status();
-    tray.setTooltip(`Xteink Sync — ${statusLine()}`);
+    tray.setTooltip(`Pocket Sync — ${statusLine()}`);
     tray.setMenu([
       item(statusLine(), "status", false),
       "separator",
@@ -85,7 +85,7 @@ export function startDesktopShell(
       "separator",
       item(app.config.current.autoSyncEnabled ? "Pause auto-sync" : "Resume auto-sync", "pause"),
       "separator",
-      item("Quit Xteink Sync", "quit"),
+      item("Quit Pocket Sync", "quit"),
     ]);
   };
 

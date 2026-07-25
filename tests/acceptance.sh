@@ -6,11 +6,11 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-WORK="${WORK:-$(mktemp -d -t xteink-acceptance)}"
+WORK="${WORK:-$(mktemp -d -t pocket-acceptance)}"
 DATA="$WORK/data"
 DEV="$WORK/device"
 API="http://127.0.0.1:8787"
-VENV="${XTEINK_VENV:-$HOME/Library/Application Support/xteink-sync/engine/.venv}"
+VENV="${POCKET_VENV:-$HOME/Library/Application Support/pocket-sync/engine/.venv}"
 
 pass=0; fail=0
 ok()   { printf '  \033[32m✓\033[0m %s\n' "$1"; pass=$((pass+1)); }
@@ -51,7 +51,7 @@ starts() { grep -c 'START ' "$WORK/device.log"; }
 
 step "Booting daemon and fake device ($WORK)"
 start_device ""
-XTEINK_DATA_DIR="$DATA" deno run --allow-read --allow-write --allow-net --allow-run \
+POCKET_DATA_DIR="$DATA" deno run --allow-read --allow-write --allow-net --allow-run \
   --allow-env --allow-sys --unstable-net --unstable-raw-imports "$ROOT/src/main.ts" \
   > "$WORK/daemon.log" 2>&1 &
 DAEMON_PID=$!

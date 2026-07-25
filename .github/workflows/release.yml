@@ -1,0 +1,135 @@
+name: Release
+
+# Tag a version to cut a release:
+#   git tag v0.1.0 && git push origin v0.1.0
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Version to build (e.g. v0.1.0) — publishes a draft release"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS artifacts must be built on macOS: `deno desktop` ad-hoc signs the
+          # bundle with codesign and builds the .dmg with hdiutil, and arm64 macOS
+          # will not launch an unsigned binary at all.
+          - name: macOS (arm64 + x64)
+            os: macos-14
+            targets: aarch64-apple-darwin x86_64-apple-darwin
+          # Everything else cross-compiles from Linux — Deno fetches prebuilt
+          # per-target runtimes, so no Windows or ARM host is needed.
+          - name: Windows + Linux
+            os: ubuntu-latest
+            targets: x86_64-pc-windows-msvc x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      # Only used at build time, to download Pillow/lxml wheels for each target.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The portable CPython tarballs are ~30 MB each and never change for a
+      # given pin, so cache them across runs.
+      - name: Cache CPython downloads
+        uses: actions/cache@v4
+        with:
+          path: build/cache
+          key: cpython-${{ runner.os }}-${{ hashFiles('scripts/fetch_python.ts') }}
+
+      # The vendored CrossPoint modules are committed; re-fetch only if a
+      # checkout somehow lacks them, so a build never silently ships without
+      # the optimizer.
+      - name: Ensure vendored engine present
+        run: |
+          test -f engine/vendor/crosspoint_reader/optimizer.py || bash engine/fetch_vendor.sh
+          cat engine/vendor/PINNED_AT
+
+      - name: Check, lint, test
+        run: |
+          deno task check
+          deno task test
+
+      - name: Build artifacts
+        run: |
+          for target in ${{ matrix.targets }}; do
+            echo "::group::$target"
+            deno task package --target "$target"
+            echo "::endgroup::"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ runner.os }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: staging
+          merge-multiple: true
+
+      - name: Verify the tag matches deno.json
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          declared="v$(python3 -c 'import json;print(json.load(open("deno.json"))["version"])')"
+          if [ "$tag" != "$declared" ]; then
+            echo "::error::tag $tag does not match deno.json version $declared — bump one of them"
+            exit 1
+          fi
+
+      - name: Checksums
+        working-directory: staging
+        run: |
+          ls -lh
+          sha256sum * | tee SHA256SUMS.txt
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          draft: ${{ github.event_name == 'workflow_dispatch' }}
+          generate_release_notes: true
+          files: staging/*
+          body: |
+            Download the file for your machine and open it — no setup step, the
+            resampling engine ships inside each build.
+
+            | Platform | File |
+            | --- | --- |
+            | macOS (Apple Silicon) | `PocketSync-macos-arm64.dmg` |
+            | macOS (Intel) | `PocketSync-macos-x64.dmg` |
+            | Windows (x64) | `PocketSync-windows-x64.msi` |
+            | Linux (x64) | `PocketSync-linux-x64.AppImage` |
+            | Linux (arm64) | `PocketSync-linux-arm64.AppImage` |
+
+            These builds are signed ad hoc rather than with a paid certificate, so
+            the OS warns on first launch: on macOS right-click → **Open** (or
+            `xattr -dr com.apple.quarantine`), on Windows **More info → Run anyway**.
+
+            Calibre is optional — EPUB syncs without it; other formats need it
+            installed to convert.

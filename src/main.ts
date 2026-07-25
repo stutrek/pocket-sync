@@ -60,7 +60,7 @@ setTimeout(async () => {
     try {
       const { isDesktop, startDesktopShell } = await import("./desktop/shell.ts");
       if (isDesktop()) {
-        const startHidden = Deno.env.get("XTEINK_START_HIDDEN") === "1";
+        const startHidden = Deno.env.get("POCKET_START_HIDDEN") === "1";
         shell = startDesktopShell(app, windowUrl!, { startHidden, hideDock: startHidden });
       } else {
         app.log.warn(

@@ -1,12 +1,12 @@
 {
-  "name": "xteink-sync",
+  "name": "pocket-sync",
   "version": "0.1.0",
   "exports": "./src/main.ts",
   "tasks": {
     "dev": "deno run --allow-read --allow-write --allow-net --allow-run --allow-env --allow-sys --unstable-net --unstable-raw-imports --watch src/main.ts",
     "start": "deno run --allow-read --allow-write --allow-net --allow-run --allow-env --allow-sys --unstable-net --unstable-raw-imports src/main.ts",
     "desktop": "deno desktop --allow-read --allow-write --allow-net --allow-run --allow-env --allow-sys --unstable-net --unstable-raw-imports src/main.ts",
-    "build": "deno desktop --allow-read --allow-write --allow-net --allow-run --allow-env --allow-sys --unstable-net --unstable-raw-imports --output dist/XteinkSync.app src/main.ts",
+    "build": "deno desktop --allow-read --allow-write --allow-net --allow-run --allow-env --allow-sys --unstable-net --unstable-raw-imports --output dist/PocketSync.app src/main.ts",
     "setup": "bash scripts/setup.sh",
     "vendor": "bash engine/fetch_vendor.sh",
     "package": "deno run -A scripts/package.ts",
@@ -17,8 +17,8 @@
   },
   "desktop": {
     "app": {
-      "name": "Xteink Sync",
-      "identifier": "com.xteink.sync",
+      "name": "Pocket Sync",
+      "identifier": "com.pocket.sync",
       "icons": {
         "macos": "assets/icon.png"
       }

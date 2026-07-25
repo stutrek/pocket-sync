@@ -258,7 +258,7 @@ export class SyncEngine {
       if (unmanaged.length) {
         this.log.info(
           "sync.unmanaged",
-          `Left ${unmanaged.length} file(s) not sent by Xteink Sync in place`,
+          `Left ${unmanaged.length} file(s) not sent by Pocket Sync in place`,
           { deviceId, detail: { paths: unmanaged.slice(0, 20) } },
         );
       }

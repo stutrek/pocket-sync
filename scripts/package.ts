@@ -49,21 +49,21 @@ function artifacts(spec: TargetSpec): Artifact {
 
   if (spec.target.includes("apple-darwin")) {
     return {
-      installer: `XteinkSync-${label}.dmg`,
-      plain: `XteinkSync-${label}.app`,
+      installer: `PocketSync-${label}.dmg`,
+      plain: `PocketSync-${label}.app`,
       icon: "assets/icon.png",
     };
   }
   if (spec.windows) {
     return {
-      installer: `XteinkSync-${label}.msi`,
-      plain: `XteinkSync-${label}`,
+      installer: `PocketSync-${label}.msi`,
+      plain: `PocketSync-${label}`,
       icon: "assets/icon.ico",
     };
   }
   return {
-    installer: `XteinkSync-${label}.AppImage`,
-    plain: `XteinkSync-${label}`,
+    installer: `PocketSync-${label}.AppImage`,
+    plain: `PocketSync-${label}`,
     icon: "assets/icon.png",
   };
 }

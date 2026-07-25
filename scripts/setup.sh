@@ -11,7 +11,7 @@ ok()   { printf '  \033[32m✓\033[0m %s\n' "$1"; }
 warn() { printf '  \033[33m!\033[0m %s\n' "$1"; }
 fail() { printf '  \033[31m✗\033[0m %s\n' "$1"; }
 
-echo "Xteink Sync setup"
+echo "Pocket Sync setup"
 echo
 
 echo "Runtime:"
@@ -45,7 +45,7 @@ echo
 echo "Python sidecar:"
 # The venv lives in the data dir, not the repo, so a packaged .app finds the
 # same interpreter the dev build uses.
-data_dir="${XTEINK_DATA_DIR:-$HOME/Library/Application Support/xteink-sync}"
+data_dir="${POCKET_DATA_DIR:-$HOME/Library/Application Support/pocket-sync}"
 venv="$data_dir/engine/.venv"
 py="${PYTHON:-python3}"
 if ! command -v "$py" >/dev/null 2>&1; then

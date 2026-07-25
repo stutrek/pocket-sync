@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate the tray and app icons (run once; outputs live in assets/).
 
-Usage: "$XTEINK_VENV/bin/python3" scripts/make_icons.py
+Usage: "$POCKET_VENV/bin/python3" scripts/make_icons.py
 """
 import os
 
