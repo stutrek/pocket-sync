@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Xteink Sync</title>
+    <link rel="stylesheet" href="/style.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="dot" id="health-dot"></span>
+        <strong>Xteink Sync</strong>
+      </div>
+      <nav class="tabs" id="tabs">
+        <button data-tab="library" class="active">Library</button>
+        <button data-tab="lists">Lists</button>
+        <button data-tab="devices">Devices</button>
+        <button data-tab="settings">Settings</button>
+        <button data-tab="logs">Logs</button>
+      </nav>
+      <div class="status" id="status">…</div>
+    </header>
+
+    <div id="banners"></div>
+
+    <main>
+      <section id="view-library" class="view active">
+        <div class="toolbar">
+          <input type="search" id="search" placeholder="Search title, author, series…"
+            autocomplete="off">
+          <select id="list-filter"><option value="">All books</option></select>
+          <span class="spacer"></span>
+          <span id="selection-info" class="muted"></span>
+          <select id="list-target" class="hidden"></select>
+          <button id="add-to-list" class="hidden">Add to list</button>
+          <button id="remove-from-list" class="hidden">Remove from list</button>
+          <button id="delete-selected" class="danger hidden">Delete</button>
+          <button id="upload-btn" class="primary">Upload books…</button>
+          <input type="file" id="file-input" multiple hidden>
+        </div>
+        <div id="dropzone"
+          class="dropzone">Drop EPUB, MOBI, AZW3, PDF, DOCX, TXT… here to add them</div>
+        <div id="upload-queue" class="upload-queue"></div>
+        <div id="book-grid" class="grid"></div>
+        <p id="library-empty"
+          class="empty hidden">No books yet. Upload something to get started.</p>
+      </section>
+
+      <section id="view-lists" class="view">
+        <div class="split">
+          <div class="pane">
+            <div class="toolbar">
+              <input id="new-list-name" placeholder="New list name">
+              <button id="create-list" class="primary">Create</button>
+            </div>
+            <ul id="list-index" class="list-index"></ul>
+          </div>
+          <div class="pane grow">
+            <div class="toolbar">
+              <h2 id="list-title">Select a list</h2>
+              <span class="spacer"></span>
+              <button id="rename-list" class="hidden">Rename</button>
+              <button id="delete-list" class="danger hidden">Delete list</button>
+            </div>
+            <table class="table" id="list-members"></table>
+          </div>
+        </div>
+      </section>
+
+      <section id="view-devices" class="view">
+        <div class="toolbar">
+          <button id="discover-now">Scan for devices</button>
+          <span class="spacer"></span>
+          <span
+            class="muted">Devices are matched by their /api/status identity, not their IP.</span>
+        </div>
+        <div id="device-list"></div>
+      </section>
+
+      <section id="view-settings" class="view">
+        <div class="split">
+          <div class="pane grow">
+            <h2>Settings</h2>
+            <form id="settings-form" class="form"></form>
+            <button id="save-settings" class="primary">Save settings</button>
+            <p class="muted" id="settings-note"></p>
+          </div>
+          <div class="pane grow">
+            <h2>Resampling profiles</h2>
+            <div id="profiles"></div>
+            <button id="new-profile">New profile</button>
+          </div>
+        </div>
+      </section>
+
+      <section id="view-logs" class="view">
+        <div class="toolbar">
+          <select id="log-level">
+            <option value="debug">All</option>
+            <option value="info" selected>Info and above</option>
+            <option value="warn">Warnings and errors</option>
+            <option value="error">Errors only</option>
+          </select>
+          <label class="check"><input type="checkbox" id="log-follow" checked> Follow</label>
+          <span class="spacer"></span>
+          <button id="clear-logs">Clear view</button>
+        </div>
+        <div id="log-view" class="logs"></div>
+      </section>
+    </main>
+
+    <div id="book-detail" class="drawer hidden"></div>
+    <div id="toasts" class="toasts"></div>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

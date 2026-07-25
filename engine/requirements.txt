@@ -1,0 +1,3 @@
+# Runtime deps of the vendored CrossPoint optimizer (imported lazily inside it).
+Pillow>=10.0
+lxml>=5.0

@@ -1,0 +1,4 @@
+repo=crosspoint-reader/calibre-plugins
+commit=37519a1debcb3fbd5089e0c70e05ef5817060502
+files=optimizer.py textsplit.py ws_client.py
+fetched=2026-07-25T04:38:33Z
