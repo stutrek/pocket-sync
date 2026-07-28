@@ -14,6 +14,7 @@
  * the build falls back to the plain app directory and says so.
  */
 import { buildRuntime, hostTarget, TARGETS, type TargetSpec } from "./fetch_python.ts";
+import { ensureLocalNetworkUsage } from "./mac_localnet.ts";
 
 const ROOT = new URL("../", import.meta.url).pathname.replace(/\/$/, "");
 const DIST = `${ROOT}/dist`;
@@ -96,6 +97,50 @@ async function build(spec: TargetSpec, output: string, icon: string): Promise<st
   return null;
 }
 
+/**
+ * macOS is built in two steps rather than straight to a .dmg.
+ *
+ * `deno desktop` generates the Info.plist and seals the disk image in one go,
+ * and the plist it writes has no `NSLocalNetworkUsageDescription` — which on
+ * macOS 15+ means the app is denied LAN access silently and forever, with no
+ * prompt and no entry under Privacy & Security (scripts/mac_localnet.ts). So:
+ * build the plain bundle, declare the usage, then wrap it ourselves.
+ */
+async function buildMacos(
+  spec: TargetSpec,
+  installer: string,
+  plain: string,
+  icon: string,
+): Promise<string | null> {
+  const app = await build(spec, plain, icon);
+  if (!app) return null;
+
+  if (Deno.build.os === "darwin") {
+    await ensureLocalNetworkUsage(app);
+  } else {
+    console.log(
+      "    ! not on macOS: cannot declare local network access, the app will not " +
+        "reach readers on the LAN",
+    );
+  }
+
+  const dmg = `${DIST}/${installer}`;
+  await Deno.remove(dmg).catch(() => {});
+  const out = await new Deno.Command("hdiutil", {
+    args: ["create", "-volname", "Pocket Sync", "-srcfolder", app, "-ov", "-format", "UDZO", dmg],
+    stdout: "null",
+    stderr: "piped",
+  }).output().catch(() => null);
+  if (!out?.success) {
+    const err = out ? new TextDecoder().decode(out.stderr).trim().split("\n").pop() : "no hdiutil";
+    console.log(`    ! ${installer} failed: ${err}`);
+    console.log(`  · keeping ${plain}`);
+    return app;
+  }
+  await Deno.remove(app, { recursive: true }).catch(() => {});
+  return dmg;
+}
+
 async function size(path: string): Promise<string> {
   try {
     const out = await new Deno.Command("du", { args: ["-sh", path], stdout: "piped" }).output();
@@ -117,6 +162,17 @@ if (import.meta.main) {
   }
 
   await Deno.mkdir(DIST, { recursive: true });
+
+  // `deno desktop` embeds src/web/static/app.bundle.js as a text import, so the
+  // UI must be bundled before any target is built. This shells out directly
+  // rather than through a task, so the `ui` task dependency doesn't apply here.
+  console.log("· bundling web UI");
+  const ui = await new Deno.Command("deno", { args: ["task", "ui"], cwd: ROOT }).output();
+  if (!ui.success) {
+    console.error("failed to bundle the web UI");
+    Deno.exit(1);
+  }
+
   const results: { target: string; artifact: string; size: string }[] = [];
 
   for (const spec of specs) {
@@ -126,10 +182,15 @@ if (import.meta.main) {
 
     const { installer, plain, icon } = artifacts(spec);
     console.log(`  · building ${installer}`);
-    let built = await build(spec, installer, icon);
-    if (!built) {
-      console.log(`  · retrying as ${plain}`);
-      built = await build(spec, plain, icon);
+    let built: string | null;
+    if (spec.target.includes("apple-darwin")) {
+      built = await buildMacos(spec, installer, plain, icon);
+    } else {
+      built = await build(spec, installer, icon);
+      if (!built) {
+        console.log(`  · retrying as ${plain}`);
+        built = await build(spec, plain, icon);
+      }
     }
     if (built) {
       // `deno desktop` leaves the intermediate app dir next to the installer;

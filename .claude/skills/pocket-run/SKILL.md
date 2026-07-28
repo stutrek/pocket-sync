@@ -11,7 +11,8 @@ description: How to run, debug and change the Pocket Sync app — the required D
 deno task setup     # dev checkout only: venv + vendored engine (users never run this)
 deno task dev       # headless daemon + web UI on 127.0.0.1:8787, --watch
 deno task start     # same, no watch
-deno task desktop   # builds and runs the real menu-bar app from source
+deno task desktop   # runs the real menu-bar app from source (deno desktop --hmr)
+deno task build     # packages the app to dist/PocketSync.app — builds only, never runs
 deno task check     # type-check + lint + fmt --check — run before finishing
 ```
 
@@ -50,16 +51,40 @@ shows up at runtime as `NotCapable`, not as a prompt.
    open new ones. There is no `BrowserWindow.main`.
 4. **`deno desktop` is hidden from `deno --help`** but exists (`deno desktop --help`). Desktop APIs
    are absent under plain `deno run` — `isDesktop()` guards this.
-5. **A broken shell must not take the daemon down.** Shell startup is wrapped in try/catch; keep it
+5. **`deno desktop` without `--hmr` only builds.** Despite the help text saying "Build and run", a
+   bare `deno desktop src/main.ts` compiles a bundle into the cwd and exits 0 — nothing launches.
+   `--hmr` is what actually starts the app (compiling to a cached dylib under
+   `~/Library/Caches/deno/desktop/` and watching the repo), which is why `deno task desktop` carries
+   it. To run an already-built bundle instead: `open "Pocket Sync.app"`, or invoke
+   `Contents/MacOS/laufey_webview` directly to keep stdout.
+6. **A broken shell must not take the daemon down.** Shell startup is wrapped in try/catch; keep it
    that way.
-6. **The webview is WebKit, not Chromium.** Keep `src/web/static/` to well-supported CSS/JS — no
-   bleeding-edge APIs, no build step.
+7. **The webview is WebKit, not Chromium.** Keep `src/web/ui/` and `style.css` to well-supported
+   CSS/JS — no bleeding-edge APIs.
+8. **The UI is built, not served from source.** `src/web/ui/*.tsx` (Preact) is bundled by
+   `deno task ui` into `src/web/static/app.bundle.js`, which `server.ts` embeds as a text import.
+   Every run/build task declares `ui` as a dependency, so the bundle is always fresh — but the
+   import is resolved at process start, so a UI edit needs a rebuild _and_ a restart. For a tight
+   loop run `deno task ui:watch` alongside `deno task dev`. The bundle is gitignored.
+9. **`index.html` must load the bundle with `type="module"`.** `deno bundle` emits ESM; as a classic
+   script its top-level bindings become globals, and the store's `status` signal then collides with
+   the built-in `window.status`, which silently breaks the whole UI.
+10. **macOS denies the desktop build all LAN access unless the bundle asks for it.** From macOS 15
+    on, local network access is granted per app bundle — and an app whose `Info.plist` lacks
+    `NSLocalNetworkUsageDescription` is never prompted for, never appears under Privacy & Security ›
+    Local Network, and simply has its LAN traffic dropped. Both bundles `deno desktop` produces (the
+    cached `laufey_webview.app` used by `--hmr`, and the app it builds) ship without that key, so
+    discovery finds nothing and even a manual host cannot be probed, while the identical code under
+    `deno task start` works because the terminal owns the grant. `scripts/mac_localnet.ts` adds the
+    key and re-signs ad hoc; the `desktop`, `build` and `package` tasks all run it. Symptom to
+    recognise: sweeps complete on schedule, no errors, nothing ever answers — surfaced in the UI as
+    `discovery.silent`.
 
 ## Debugging
 
-- Logs: stderr, `<dataDir>/logs/pocket-sync.log` (rotating JSONL), the Logs tab, and the SSE stream
-  at `/api/events`. High-frequency progress goes to the bus only (`bus.emit`), not the log file —
-  don't switch it to `log.*`.
+- Logs: stderr, `<dataDir>/logs/pocket-sync.log` (rotating JSONL), the Activity tab, and the SSE
+  stream at `/api/events`. High-frequency progress goes to the bus only (`bus.emit`), not the log
+  file — don't switch it to `log.*`.
 - `GET /api/health?recheck=1` re-probes Calibre and the engine.
 - `GET /api/books/<id>/optimized?profile=<id>` returns exactly what a device would receive — the
   fastest way to inspect optimizer changes.

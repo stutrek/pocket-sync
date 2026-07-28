@@ -79,7 +79,7 @@ export function startDesktopShell(
       item(statusLine(), "status", false),
       "separator",
       item("Open library", "open"),
-      item("View logs", "logs"),
+      item("View activity", "logs"),
       item("Sync now", "sync", s.devicesOnline > 0 && !s.syncing),
       item("Scan for devices", "scan"),
       "separator",
@@ -95,7 +95,7 @@ export function startDesktopShell(
         openLibrary("/");
         break;
       case "logs":
-        openLibrary("/?tab=logs");
+        openLibrary("/?tab=activity");
         break;
       case "scan":
         await app.devices.sweep();

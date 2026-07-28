@@ -25,6 +25,60 @@ const DROP_UPLOAD = Number(args.get("drop-upload") ?? 0);
 await Deno.mkdir(ROOT, { recursive: true });
 let uploadCount = 0;
 
+/**
+ * The reader's own settings, as its web UI writes them — kept beside the file
+ * tree rather than in it so a listing still only shows books. Pocket Sync
+ * writes the KOReader Sync block here so the user never types it (§8.2).
+ *
+ * `--settings-readonly 1` makes the endpoint accept and discard, which is how a
+ * firmware that ignores the fields would look. Every flag takes a value: the
+ * argument parser above reads pairs.
+ */
+const SETTINGS_FILE = `${ROOT}.settings.json`;
+const SETTINGS_READONLY = args.get("settings-readonly") === "1";
+/** Pre-set values, e.g. a reader already pointed at another sync server. */
+const settings: Record<string, unknown> = JSON.parse(args.get("settings") ?? "{}");
+const writeSettings = () => Deno.writeTextFile(SETTINGS_FILE, JSON.stringify(settings, null, 2));
+await writeSettings();
+
+/**
+ * `GET /api/settings` as the real firmware answers it: one descriptor per
+ * setting, with the value inside. Categories and types are copied from a real
+ * X3 on 1.4.0-tiny so a client that assumes a flat object fails here the same
+ * way it fails on hardware.
+ */
+const SETTING_META: Record<string, { name: string; category: string; type: string }> = {
+  koUsername: { name: "KOReader Username", category: "KOReader Sync", type: "string" },
+  koPassword: { name: "KOReader Password", category: "KOReader Sync", type: "string" },
+  koServerUrl: { name: "Sync Server URL", category: "KOReader Sync", type: "string" },
+  koMatchMethod: { name: "Document Matching", category: "KOReader Sync", type: "enum" },
+  deviceName: { name: "Device Name", category: "System", type: "string" },
+};
+function describeSettings() {
+  const keys = new Set([...Object.keys(SETTING_META), ...Object.keys(settings)]);
+  return [...keys].map((key) => ({
+    key,
+    name: SETTING_META[key]?.name ?? key,
+    category: SETTING_META[key]?.category ?? "System",
+    type: SETTING_META[key]?.type ?? "string",
+    value: settings[key] ?? (SETTING_META[key]?.type === "enum" ? 0 : ""),
+    ...(key === "koMatchMethod" ? { options: ["Filename", "Binary"] } : {}),
+  }));
+}
+
+/** The reader's OPDS catalog list, persisted beside the settings. */
+interface FakeCatalog {
+  name: string;
+  url: string;
+  username: string;
+  filenameFormat: string;
+  hasPassword: boolean;
+}
+const CATALOG_FILE = `${ROOT}.opds.json`;
+const catalogs: FakeCatalog[] = JSON.parse(args.get("catalogs") ?? "[]");
+const writeCatalogs = () => Deno.writeTextFile(CATALOG_FILE, JSON.stringify(catalogs, null, 2));
+await writeCatalogs();
+
 const localPath = (devicePath: string) =>
   `${ROOT}/${devicePath.replace(/^\/+/, "").replace(/\.\./g, "")}`;
 
@@ -57,6 +111,51 @@ Deno.serve({ port: HTTP_PORT, hostname: "127.0.0.1" }, async (req) => {
       firmware: "fake-1.0",
       battery: 87,
     });
+  }
+
+  if (p === "/api/settings") {
+    if (req.method === "POST") {
+      const patch = await req.json().catch(() => ({}));
+      // A partial body: only the named fields change, as the firmware's own
+      // settings page relies on.
+      if (!SETTINGS_READONLY) Object.assign(settings, patch);
+      await writeSettings();
+      console.log(`[fake-device] settings ${JSON.stringify(patch)}`);
+      return Response.json({ ok: true });
+    }
+    // Asymmetric, and confirmed against firmware 1.4.0-tiny: the write takes a
+    // flat partial object, but the read answers with an array of *descriptors*.
+    // Modelling it as a flat object here is what let a client that could not
+    // parse the real response pass every test.
+    return Response.json(describeSettings());
+  }
+
+  // The reader's own OPDS catalog list. `index` is the slot: a POST carrying
+  // one edits it in place, a POST without one appends — which is exactly how
+  // a careless client ends up adding a duplicate on every sync.
+  if (p === "/api/opds") {
+    if (req.method === "POST") {
+      const body = await req.json().catch(() => ({})) as Record<string, unknown>;
+      const entry = {
+        name: String(body.name ?? ""),
+        url: String(body.url ?? ""),
+        username: String(body.username ?? ""),
+        filenameFormat: String(body.filenameFormat ?? "title_author"),
+        hasPassword: typeof body.password === "string" && body.password.length > 0,
+      };
+      const index = typeof body.index === "number" ? body.index : -1;
+      if (index >= 0 && index < catalogs.length) {
+        // An edit keeps the stored password when the field is omitted.
+        entry.hasPassword = entry.hasPassword || catalogs[index].hasPassword;
+        catalogs[index] = entry;
+      } else {
+        catalogs.push(entry);
+      }
+      await writeCatalogs();
+      console.log(`[fake-device] opds ${JSON.stringify(body)}`);
+      return Response.json({ ok: true });
+    }
+    return Response.json(catalogs.map((c, index) => ({ index, ...c })));
   }
 
   if (p === "/api/files") {

@@ -61,6 +61,16 @@ export class Sidecar {
       this.log.error("runtime.failed", `Could not unpack the Python runtime: ${err}`);
       this.#bundled = null;
     }
+    // Present on disk isn't the same as runnable — an unpack for the wrong
+    // architecture, or a placeholder in a source checkout, execs with code 126
+    // and looks like a broken engine instead of "try the next interpreter".
+    if (this.#bundled && !(await runsPython(this.#bundled))) {
+      this.log.warn(
+        "runtime.unusable",
+        `Bundled interpreter at ${this.#bundled} will not run here; falling back`,
+      );
+      this.#bundled = null;
+    }
   }
 
   /** Configured path, then the bundled runtime, then a dev venv, then PATH. */
@@ -126,7 +136,13 @@ export class Sidecar {
 
   #readLines(stream: ReadableStream<Uint8Array>, onLine: (line: string) => void) {
     (async () => {
-      const reader = stream.pipeThrough(new TextDecoderStream()).getReader();
+      // The UI graph imports our types, which drags @types/node in and retypes
+      // TextDecoderStream's writable side as BufferSource. Behaviour is identical
+      // either way; the cast just keeps both type worlds happy.
+      const decoded = stream.pipeThrough(
+        new TextDecoderStream() as unknown as ReadableWritablePair<string, Uint8Array>,
+      );
+      const reader = decoded.getReader();
       let buf = "";
       try {
         while (true) {
@@ -223,9 +239,31 @@ export class Sidecar {
   }
 }
 
+/** Does this interpreter actually start on this machine? */
+async function runsPython(path: string): Promise<boolean> {
+  try {
+    const out = await new Deno.Command(path, {
+      args: ["-c", "pass"],
+      stdout: "null",
+      stderr: "null",
+    }).output();
+    return out.code === 0;
+  } catch {
+    return false;
+  }
+}
+
 function canExec(path: string): boolean {
   try {
-    return Deno.statSync(path).isFile;
+    const st = Deno.statSync(path);
+    if (!st.isFile) return false;
+    // Existing isn't enough: an interpreter unpacked without its executable bit
+    // passes a bare stat and then dies at exec with code 126, which looks like
+    // a broken engine rather than "fall back to the next candidate".
+    if (Deno.build.os !== "windows" && st.mode !== null) {
+      return (st.mode & 0o111) !== 0;
+    }
+    return true;
   } catch {
     return false;
   }

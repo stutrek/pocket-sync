@@ -105,6 +105,197 @@ const MIGRATIONS: string[] = [
     value TEXT NOT NULL
   );
   `,
+
+  // v2 — the filesystem becomes the source of truth (docs/DESIGN.md).
+  //
+  // Book identity changes from a generated id to the MD5 of the source file, so
+  // old `book` rows cannot be converted — they describe app-owned copies under
+  // library/<id>/ that this model no longer keeps. They are dropped and rebuilt
+  // by the first folder scan. `device_content` is cleared with them; files left
+  // on a device under the old `<bookId>__<title>.epub` scheme stay attributable
+  // via `bookIdFromDeviceFilename()` and are cleaned up by the first sync.
+  `
+  DROP TABLE format;
+  DROP TABLE list_item;
+  DROP TABLE "list";
+  DELETE FROM device_content;
+  DROP TABLE book;
+
+  CREATE TABLE book (
+    id            TEXT PRIMARY KEY,          -- MD5 hex of the source file
+    title         TEXT NOT NULL,
+    author        TEXT NOT NULL DEFAULT '',
+    series        TEXT,
+    series_index  REAL,
+    added_at      TEXT NOT NULL,
+    cover_path    TEXT,
+    original_ext  TEXT NOT NULL,
+    epub_path     TEXT,
+    size_bytes    INTEGER NOT NULL DEFAULT 0,
+    meta_json     TEXT NOT NULL DEFAULT '{}'
+  );
+  CREATE INDEX book_title_idx ON book(title);
+  CREATE INDEX book_author_idx ON book(author);
+
+  -- Which folders hold this book, and where. A book present in two libraries is
+  -- one row each and one shared set of derived artifacts.
+  CREATE TABLE library_book (
+    library_id TEXT NOT NULL,
+    book_id    TEXT NOT NULL REFERENCES book(id) ON DELETE CASCADE,
+    path       TEXT NOT NULL,
+    added_at   TEXT NOT NULL,
+    PRIMARY KEY (library_id, book_id)
+  );
+  CREATE INDEX library_book_book_idx ON library_book(book_id);
+
+  -- Scan cache: hashing is keyed on (size, mtime) so a rescan only rehashes
+  -- files that actually changed. This is what makes MD5 identity affordable.
+  CREATE TABLE file_index (
+    path       TEXT PRIMARY KEY,
+    library_id TEXT NOT NULL,
+    size       INTEGER NOT NULL,
+    mtime      INTEGER NOT NULL,
+    md5        TEXT NOT NULL,
+    seen_at    TEXT NOT NULL
+  );
+  CREATE INDEX file_index_library_idx ON file_index(library_id);
+
+  -- Imports are durable so one that blocks on the user (a DRM key, a missing
+  -- plugin) survives a window close instead of vanishing with a toast.
+  CREATE TABLE import_job (
+    id         TEXT PRIMARY KEY,
+    library_id TEXT NOT NULL,
+    path       TEXT NOT NULL UNIQUE,
+    filename   TEXT NOT NULL,
+    book_id    TEXT,
+    stage      TEXT NOT NULL DEFAULT 'queued',
+    state      TEXT NOT NULL DEFAULT 'running',  -- running|blocked|done|failed
+    needs      TEXT,                             -- drm-key|drm-plugin|drm-plugin-disabled|drm-kfx|calibre|calibre-busy
+    error      TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+  CREATE INDEX import_job_state_idx ON import_job(state);
+
+  -- Reading progress, fed by the kosync listener. Keyed per library so two
+  -- people reading the same file are independent, and kept when the source file
+  -- disappears so re-adding it restores where you were.
+  CREATE TABLE reading_state (
+    library_id      TEXT NOT NULL,
+    book_id         TEXT NOT NULL,
+    percentage      REAL NOT NULL DEFAULT 0,
+    position_json   TEXT NOT NULL DEFAULT '{}',
+    finished        INTEGER NOT NULL DEFAULT 0,
+    finished_source TEXT,                        -- auto|manual
+    device_id       TEXT,
+    updated_at      TEXT NOT NULL,
+    PRIMARY KEY (library_id, book_id)
+  );
+
+  -- Maps the hash the reader reports (computed over the delivered bytes, which
+  -- differ per resample profile) back to our source-file MD5.
+  CREATE TABLE kosync_document (
+    document_hash TEXT PRIMARY KEY,
+    book_id       TEXT NOT NULL,
+    profile_hash  TEXT,
+    created_at    TEXT NOT NULL
+  );
+
+  CREATE TABLE kosync_user (
+    username   TEXT PRIMARY KEY,
+    key_md5    TEXT NOT NULL,
+    library_id TEXT,
+    created_at TEXT NOT NULL
+  );
+
+  -- What survives of sync_rule. The bound folder is the source, so there is no
+  -- source type, no list and no mode left to choose.
+  CREATE TABLE device_settings (
+    device_id       TEXT PRIMARY KEY REFERENCES device(id) ON DELETE CASCADE,
+    profile_id      TEXT REFERENCES resample_profile(id) ON DELETE SET NULL,
+    enabled         INTEGER NOT NULL DEFAULT 1,
+    auto_on_connect INTEGER NOT NULL DEFAULT 1
+  );
+  INSERT INTO device_settings (device_id, profile_id, enabled, auto_on_connect)
+    SELECT device_id, profile_id, enabled, auto_on_connect FROM sync_rule;
+  DROP TABLE sync_rule;
+  `,
+
+  // v3 — users, and many folders per device (docs/DESIGN.md).
+  //
+  // Reverses "one device syncs one folder". A user is a named config entry, not
+  // an account; a device records which user is currently holding it, and reading
+  // progress keys on that user rather than on a folder — so one person reading
+  // from two folders has a single position per book.
+  `
+  ALTER TABLE device_settings ADD COLUMN user_id TEXT;
+
+  CREATE TABLE reading_state_v3 (
+    user_id         TEXT NOT NULL,
+    book_id         TEXT NOT NULL,
+    percentage      REAL NOT NULL DEFAULT 0,
+    position_json   TEXT NOT NULL DEFAULT '{}',
+    finished        INTEGER NOT NULL DEFAULT 0,
+    finished_source TEXT,
+    device_id       TEXT,
+    updated_at      TEXT NOT NULL,
+    PRIMARY KEY (user_id, book_id)
+  );
+  DROP TABLE reading_state;
+  ALTER TABLE reading_state_v3 RENAME TO reading_state;
+
+  -- kosync credentials likewise belong to a person, not a folder.
+  DROP TABLE kosync_user;
+  CREATE TABLE kosync_user (
+    username   TEXT PRIMARY KEY,
+    key_md5    TEXT NOT NULL,
+    user_id    TEXT,
+    created_at TEXT NOT NULL
+  );
+  `,
+
+  // v4 — we configure the reader's own KOReader Sync client rather than asking
+  // the user to type a URL and a password on an e-ink keyboard.
+  //
+  // `kosync_hash` fingerprints what the reader last accepted, so the usual sync
+  // costs no extra round trip; the rest is what the Devices view reports when
+  // it did not take.
+  `
+  ALTER TABLE device_settings ADD COLUMN kosync_hash   TEXT;
+  ALTER TABLE device_settings ADD COLUMN kosync_state  TEXT;
+  ALTER TABLE device_settings ADD COLUMN kosync_detail TEXT;
+  ALTER TABLE device_settings ADD COLUMN kosync_at     TEXT;
+  `,
+
+  // v5 — a person has several sync servers, and a reader may be pinned to one
+  // of them rather than following its holder's default.
+  //
+  // NULL is the normal value and means "whoever is holding this reader decides",
+  // which is what makes handing a reader over re-point it.
+  `
+  ALTER TABLE device_settings ADD COLUMN sync_server_id TEXT;
+
+  -- 'conflict' was a dead end: a reader found pointing at somebody else's sync
+  -- server was left alone forever with no way to record what it pointed at.
+  -- That server is now adopted into the holder's list instead, so clear the
+  -- verdict and let the next sync reach it.
+  UPDATE device_settings
+     SET kosync_state = NULL, kosync_detail = NULL, kosync_at = NULL
+   WHERE kosync_state = 'conflict';
+  `,
+
+  // v6 — the reader's own OPDS catalog list, which it can browse and pull from.
+  //
+  // Tracked separately from the page-sync columns rather than folded into them:
+  // the two are pushed to different endpoints, either can succeed while the
+  // other fails, and a reader nobody is holding can still have a working
+  // catalog even though it must never be given page-sync credentials.
+  `
+  ALTER TABLE device_settings ADD COLUMN opds_hash   TEXT;
+  ALTER TABLE device_settings ADD COLUMN opds_state  TEXT;
+  ALTER TABLE device_settings ADD COLUMN opds_detail TEXT;
+  ALTER TABLE device_settings ADD COLUMN opds_at     TEXT;
+  `,
 ];
 
 export class Db {

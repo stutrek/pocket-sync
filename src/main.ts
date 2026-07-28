@@ -23,7 +23,7 @@ if (desktopAddress) {
       windowUrl = `http://${hostname}:${port}`;
       app.log.info("web.window", `Desktop window server on ${windowUrl}`);
     },
-  }, handler);
+  }, (req, info) => handler(req, info));
 }
 
 const cfg = app.config.current;
@@ -33,12 +33,28 @@ try {
     hostname: cfg.webHost,
     onListen: ({ hostname, port }) =>
       app.log.info("web.listen", `Web UI on http://${hostname}:${port}`),
-  }, handler);
+  }, (req, info) => handler(req, info));
 } catch (err) {
+  const busy = err instanceof Deno.errors.AddrInUse;
   app.log.error(
     "web.listen.failed",
     `Could not bind ${cfg.webHost}:${cfg.webPort} (another instance running?): ${err}`,
   );
+  // Headless has no other way in, so carrying on would leave a second daemon
+  // running invisibly against the same database while the browser shows the
+  // *other* instance — which is indistinguishable from this one being broken.
+  // The desktop build keeps going: its window has its own listener above.
+  if (!desktopAddress) {
+    console.error(
+      busy
+        ? `\nPocket Sync is already running on ${cfg.webHost}:${cfg.webPort}.\n` +
+          `Open http://${cfg.webHost}:${cfg.webPort} to use it, quit it first, or change ` +
+          `webPort in the settings.\n`
+        : `\nPocket Sync could not serve on ${cfg.webHost}:${cfg.webPort}: ${err}\n`,
+    );
+    await app.stop().catch(() => {});
+    Deno.exit(1);
+  }
 }
 
 if (!windowUrl) windowUrl = `http://127.0.0.1:${cfg.webPort}`;

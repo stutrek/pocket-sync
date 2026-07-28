@@ -288,8 +288,10 @@ def _extract_data_uris(entries, order, zname, doc, opf, opf_dir, counter, log, p
         if profile is not None and opts is not None:
             try:
                 from .optimizer import process_image
-                data, _meta = process_image(raw, profile, opts, name)
-                out_ext, mt = 'jpg', 'image/jpeg'
+                data, meta = process_image(raw, profile, opts,
+                                           '%s.%s' % (name, out_ext))
+                if meta['converted']:  # else the original bytes came back
+                    out_ext, mt = meta['ext'].lstrip('.'), meta['media_type']
             except Exception as exc:
                 log('SPLIT-ERR', 'data-URI image kept raw (%s)' % exc)
         if mt is None:

@@ -3,17 +3,38 @@
   "version": "0.1.0",
   "exports": "./src/main.ts",
   "tasks": {
-    "dev": "deno run --allow-read --allow-write --allow-net --allow-run --allow-env --allow-sys --unstable-net --unstable-raw-imports --watch src/main.ts",
-    "start": "deno run --allow-read --allow-write --allow-net --allow-run --allow-env --allow-sys --unstable-net --unstable-raw-imports src/main.ts",
-    "desktop": "deno desktop --allow-read --allow-write --allow-net --allow-run --allow-env --allow-sys --unstable-net --unstable-raw-imports src/main.ts",
-    "build": "deno desktop --allow-read --allow-write --allow-net --allow-run --allow-env --allow-sys --unstable-net --unstable-raw-imports --output dist/PocketSync.app src/main.ts",
+    "ui": "deno bundle --platform browser src/web/ui/main.tsx -o src/web/static/app.bundle.js",
+    "ui:watch": "deno bundle --watch --platform browser src/web/ui/main.tsx -o src/web/static/app.bundle.js",
+    "dev": {
+      "command": "deno run --allow-read --allow-write --allow-net --allow-run --allow-env --allow-sys --unstable-net --unstable-raw-imports --watch src/main.ts",
+      "dependencies": ["ui"]
+    },
+    "start": {
+      "command": "deno run --allow-read --allow-write --allow-net --allow-run --allow-env --allow-sys --unstable-net --unstable-raw-imports src/main.ts",
+      "dependencies": ["ui"]
+    },
+    "desktop": {
+      "command": "deno desktop --hmr --allow-read --allow-write --allow-net --allow-run --allow-env --allow-sys --unstable-net --unstable-raw-imports src/main.ts",
+      "dependencies": ["ui", "macprep"]
+    },
+    "build": {
+      "command": "deno desktop --allow-read --allow-write --allow-net --allow-run --allow-env --allow-sys --unstable-net --unstable-raw-imports --output dist/PocketSync.app src/main.ts && deno run -A scripts/mac_localnet.ts --app dist/PocketSync.app",
+      "dependencies": ["ui"]
+    },
+    "macprep": "deno run -A scripts/mac_localnet.ts",
     "setup": "bash scripts/setup.sh",
     "vendor": "bash engine/fetch_vendor.sh",
     "package": "deno run -A scripts/package.ts",
     "python": "deno run -A scripts/fetch_python.ts",
     "acceptance": "bash tests/acceptance.sh",
-    "test": "deno test --allow-read --allow-write --allow-env --allow-run --allow-net --unstable-net --unstable-raw-imports",
-    "check": "deno check --unstable-net --unstable-raw-imports src/main.ts tests/*.ts && deno lint && deno fmt --check"
+    "test": {
+      "command": "deno test --allow-read --allow-write --allow-env --allow-run --allow-net --unstable-net --unstable-raw-imports",
+      "dependencies": ["ui"]
+    },
+    "check": {
+      "command": "deno check --unstable-net --unstable-raw-imports src/main.ts tests/*.ts && deno check --unstable-net --unstable-raw-imports src/web/ui/main.tsx && deno lint && deno fmt --check",
+      "dependencies": ["ui"]
+    }
   },
   "desktop": {
     "app": {
@@ -27,14 +48,21 @@
   },
   "imports": {
     "@std/assert": "jsr:@std/assert@^1.0.14",
-    "@std/tar/untar-stream": "jsr:@std/tar@^0.1.10/untar-stream"
+    "@std/tar/untar-stream": "jsr:@std/tar@^0.1.10/untar-stream",
+    "@preact/signals": "npm:@preact/signals@^2.3.1",
+    "preact": "npm:preact@^10.29.7",
+    "preact/": "npm:/preact@^10.29.7/"
+  },
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "jsxImportSource": "preact"
   },
   "fmt": {
     "lineWidth": 100,
-    "exclude": ["engine/vendor", "dist"]
+    "exclude": ["engine/vendor", "dist", "src/web/static/app.bundle.js"]
   },
   "lint": {
-    "exclude": ["engine/vendor", "dist"]
+    "exclude": ["engine/vendor", "dist", "src/web/static/app.bundle.js"]
   },
-  "exclude": ["dist", "engine/vendor", "engine/.venv"]
+  "exclude": ["dist", "engine/vendor", "engine/.venv", "src/web/static/app.bundle.js"]
 }

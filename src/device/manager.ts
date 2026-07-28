@@ -64,6 +64,10 @@ export class DeviceManager {
   #lastAnnounce = new Map<string, number>();
   #timer: ReturnType<typeof setInterval> | null = null;
   #sweeping = false;
+  #lastSweepAt: string | null = null;
+  #sweeps = 0;
+  /** Last time any address answered at all, this process. */
+  #lastContactAt: string | null = null;
 
   /** Called (debounced) when a device transitions offline -> online. */
   onConnect: ((deviceId: string) => void) | null = null;
@@ -91,6 +95,49 @@ export class DeviceManager {
   stop() {
     if (this.#timer !== null) clearInterval(this.#timer);
     this.#timer = null;
+  }
+
+  /**
+   * Re-arm the timer after a settings change. `start()` fixes the interval when
+   * it is called, so without this an edited `intervalSec` is reported by
+   * `discoveryStatus()` but never actually used — the UI would claim a cadence
+   * the app is not keeping.
+   */
+  restart() {
+    this.stop();
+    this.start();
+  }
+
+  /**
+   * Whether discovery is actually looking, and how recently it looked.
+   *
+   * Scanning is continuous, but with `enabled: false` the only addresses checked
+   * are the manual hosts — so the app can be sweeping every few seconds and
+   * still be structurally unable to find a reader. The UI needs to be able to
+   * say which of those it is instead of showing a bare "no devices yet".
+   */
+  discoveryStatus() {
+    const d = this.cfg.discovery;
+    return {
+      running: this.#timer !== null,
+      broadcast: d.enabled,
+      manualHosts: d.manualHosts.filter((h) => h.trim()).length,
+      hotspotFallback: d.hotspotFallback,
+      intervalSec: Math.max(5, d.intervalSec),
+      sweeping: this.#sweeping,
+      lastSweepAt: this.#lastSweepAt,
+      /** True when nothing at all would be probed. */
+      blind: !d.enabled && !d.hotspotFallback &&
+        d.manualHosts.filter((h) => h.trim()).length === 0,
+      /**
+       * Probing, but nothing on the network has ever replied — not a broadcast,
+       * not a manual host. An empty network looks like this, and so does a
+       * platform silently dropping our LAN traffic (macOS denies local network
+       * access to an app it never prompted for), which is otherwise invisible.
+       */
+      silent: this.#sweeps >= 2 && this.#lastContactAt === null,
+      platform: Deno.build.os,
+    };
   }
 
   rows(): DeviceRow[] {
@@ -168,6 +215,7 @@ export class DeviceManager {
         const id = await this.#probe(host, port);
         if (id) seen.add(id);
       }
+      if (seen.size) this.#lastContactAt = new Date().toISOString();
 
       // Anything previously online but missing this sweep is gone.
       for (const [id, st] of this.#state) {
@@ -177,6 +225,8 @@ export class DeviceManager {
         }
       }
     } finally {
+      this.#lastSweepAt = new Date().toISOString();
+      this.#sweeps++;
       this.#sweeping = false;
     }
   }
@@ -229,7 +279,7 @@ export class DeviceManager {
         strategy,
         JSON.stringify(status),
       );
-      this.db.run("INSERT INTO sync_rule (device_id) VALUES (?) ON CONFLICT DO NOTHING", id);
+      this.db.run("INSERT INTO device_settings (device_id) VALUES (?) ON CONFLICT DO NOTHING", id);
       this.log.info(
         "device.new",
         `New device ${model ?? "?"} at ${host} (identity: ${strategy})` +

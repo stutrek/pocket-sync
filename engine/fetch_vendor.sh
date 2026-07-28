@@ -10,8 +10,22 @@
 # They are MIT licensed (CrossPoint Reader); LICENSE is vendored alongside.
 set -euo pipefail
 
-REPO="crosspoint-reader/calibre-plugins"
-PIN="${CROSSPOINT_PIN:-37519a1debcb3fbd5089e0c70e05ef5817060502}"
+# Currently a fork, not the upstream repo. It is upstream plus two fixes we hit
+# in practice and could not carry ourselves, because these files are vendored
+# verbatim and never patched locally:
+#
+#   * images are encoded as JPEG *or* PNG, whichever is smaller. The firmware
+#     decodes both (ImageDecoderFactory.cpp), and forcing JPEG inflated flat
+#     2-colour artwork ~6x — a 492 KB book came out at 778 KB — while also
+#     putting ringing artifacts around the very line art it damages most.
+#   * named HTML entities are replaced with numeric ones. The lxml round-trip
+#     drops the DOCTYPE, and without a DTD a surviving `&nbsp;` is a fatal
+#     undefined-entity error on-device.
+#
+# Both belong upstream; point REPO back at crosspoint-reader once they land
+# there, which is the whole reason this is an override rather than an edit.
+REPO="${CROSSPOINT_REPO:-stutrek/calibre-plugins}"
+PIN="${CROSSPOINT_PIN:-22efe5e5c29e77febf85c11d4c250943682cc026}"
 FILES=(optimizer.py textsplit.py ws_client.py)
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

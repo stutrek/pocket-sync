@@ -44,16 +44,53 @@ export function sanitizeForFilename(s: string, max = 60): string {
 }
 
 /**
- * Deterministic on-device filename: `<bookId>__<title>.epub`.
- * Lets us re-match device contents from `/api/files` alone if the local
- * manifest is ever lost.
+ * On-device filename. Human readable, because the reader keeps books
+ * indefinitely and the user browses them there (docs/DESIGN.md). Identity comes
+ * from the source MD5 stamped into the delivered EPUB's OPF, not from the name.
  */
-export function deviceFilename(bookId: string, title: string): string {
-  return `${bookId}__${sanitizeForFilename(title)}.epub`;
+export function deviceFilename(title: string, author?: string): string {
+  const stem = author?.trim() ? `${title} - ${author}` : title;
+  return `${sanitizeForFilename(stem, 80)}.epub`;
 }
 
-/** Recover a book id from a device filename produced by `deviceFilename`. */
-export function bookIdFromDeviceFilename(name: string): string | null {
+/**
+ * Names for a whole set at once, so a collision can be broken deterministically
+ * rather than depending on the order books happen to sync in.
+ */
+export function deviceFilenames(
+  books: { id: string; title: string; author?: string }[],
+): Map<string, string> {
+  const byName = new Map<string, { id: string; title: string; author?: string }[]>();
+  for (const book of books) {
+    const name = deviceFilename(book.title, book.author);
+    const bucket = byName.get(name);
+    if (bucket) bucket.push(book);
+    else byName.set(name, [book]);
+  }
+
+  const out = new Map<string, string>();
+  for (const [name, bucket] of byName) {
+    if (bucket.length === 1) {
+      out.set(bucket[0].id, name);
+      continue;
+    }
+    // Same title and author: fall back to a slice of the content hash, which is
+    // stable across runs and different for genuinely different files.
+    for (const book of bucket) {
+      out.set(book.id, name.replace(/\.epub$/, `_${book.id.slice(0, 6)}.epub`));
+    }
+  }
+  return out;
+}
+
+/**
+ * Recover a book id from the *legacy* `<bookId>__<title>.epub` scheme.
+ *
+ * Retained only so files placed by an older version stay attributable — they
+ * are ours, so reconciliation is allowed to remove them. New deliveries use
+ * `deviceFilename()`.
+ */
+export function legacyBookIdFromFilename(name: string): string | null {
   const m = /^([0-9a-z]{16})__.*\.epub$/i.exec(name);
   return m ? m[1] : null;
 }

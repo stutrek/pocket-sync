@@ -51,11 +51,9 @@ export class Paths {
     return `${this.engineDir}/python`;
   }
 
+  /** Derived artifacts only — the source file stays in the user's folder. */
   bookDir(bookId: string) {
     return `${this.libraryDir}/${bookId}`;
-  }
-  original(bookId: string, ext: string) {
-    return `${this.bookDir(bookId)}/original.${ext.replace(/^\./, "")}`;
   }
   epub(bookId: string) {
     return `${this.bookDir(bookId)}/book.epub`;

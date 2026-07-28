@@ -9,10 +9,15 @@ the device's web UI when no manual per-image splitting is selected:
         - optional auto-crop of uniform margins
         - scale to fit the device screen (preserving aspect ratio)
         - flatten transparency onto white and convert to grayscale
-        - re-encode as JPEG (quality 85 by default)
-    * rewrite the container: rename raster images to ``.jpg``, strip stale
+        - re-encode as whichever of JPEG (quality 85 by default) and PNG comes
+          out smaller — the two formats the firmware can decode — and keep the
+          original bytes instead when it is already a PNG/JPEG no bigger than
+          the re-encode would be
+    * rewrite the container: rename re-encoded images to match, strip stale
       width/height from ``<img>`` tags, unwrap SVG covers / SVG-wrapped images,
-      fix OPF media-types + cover meta, sync the NCX identifier, inject a small
+      substitute named HTML entities for numeric ones (the rewrite drops the
+      DOCTYPE, and without a DTD only the five XML entities are defined), fix
+      OPF media-types + cover meta, sync the NCX identifier, inject a small
       defensive stylesheet, and re-zip mimetype-first.
 
 The interactive H-split / V-split / rotate picker from the web UI is intentionally
@@ -26,6 +31,7 @@ fallbacks throughout.
 
 import io
 import os
+import posixpath
 import re
 import time
 import zipfile
@@ -52,9 +58,12 @@ MIN_CROP_DIMENSION = 240
 
 RASTER_RE = re.compile(r'\.(png|gif|webp|bmp|jpe?g)$', re.IGNORECASE)
 # Anchored: rename a whole path/filename or an isolated attribute value.
-RENAME_RE = re.compile(r'\.(png|gif|webp|bmp|jpeg)$', re.IGNORECASE)
-# Unanchored: rename references embedded inline (href/src/url(...)) in markup/CSS.
-REF_RE = re.compile(r'\.(?:png|gif|webp|bmp|jpeg)(?=["\'\)\s#?>])', re.IGNORECASE)
+RENAME_RE = re.compile(r'\.(png|gif|webp|bmp|jpe?g)$', re.IGNORECASE)
+# The firmware decodes exactly these two (lib/Epub/Epub/converters/
+# ImageDecoderFactory.cpp): JPEG via JPEGDEC, PNG via PNGdec. Every other raster
+# format has to be re-encoded, whatever that does to the file size.
+_RENDERABLE_RE = re.compile(r'\.(png|jpe?g)$', re.IGNORECASE)
+_MEDIA_TYPES = {'.jpg': 'image/jpeg', '.png': 'image/png'}
 XHTML_RE = re.compile(r'\.(xhtml|html|htm)$', re.IGNORECASE)
 
 DEFENSIVE_STYLE = (
@@ -191,8 +200,12 @@ def _should_skip_auto_crop(image_path, w, h):
 def process_image(data, profile, opts, image_path=''):
     """Run the core optimization on a single image.
 
-    Returns (jpeg_bytes, meta) where meta has orig/final dims + sizes + flags.
-    Raises on decode failure so the caller can fall back to the original bytes.
+    Returns (bytes, meta) where meta has orig/final dims + sizes + flags.
+    ``meta['converted']`` says whether the returned bytes are the new JPEG or the
+    untouched original: re-encoding is only worth it when it actually saves
+    bytes, which it does not for e.g. a small palette PNG/GIF that already fits
+    the screen. Raises on decode failure so the caller can fall back to the
+    original bytes.
     """
     from PIL import Image
 
@@ -228,19 +241,47 @@ def process_image(data, profile, opts, image_path=''):
         else:
             scaled = src.resize((final_w, final_h), Image.LANCZOS)
 
-    # --- flatten onto white, grayscale, JPEG --------------------------------
+    # --- flatten onto white, grayscale, re-encode ---------------------------
+    #
+    # Flat artwork with a small palette (a 2-bit GIF, a screenshot PNG) encodes
+    # far better as lossless indexed colour than as JPEG, so both encodings are
+    # tried and the smaller one wins. The device only decodes JPEG and PNG, so
+    # those are the only two candidates — a GIF/BMP/WebP is re-encoded even when
+    # that costs bytes, because the firmware cannot render it at all.
     rgb = _flatten_white_rgb(scaled)
     out = rgb.convert('L') if opts.grayscale else rgb
     buf = io.BytesIO()
     out.save(buf, 'JPEG', quality=int(opts.quality), optimize=True)
     jpeg = buf.getvalue()
+    buf = io.BytesIO()
+    # Indexing ≤256-colour art lets PNG drop to 1/2/4 bits per pixel; anything
+    # richer is written as-is rather than quantized, so PNG stays lossless.
+    png_src = out.convert('P', palette=Image.ADAPTIVE) if out.getcolors(256) else out
+    png_src.save(buf, 'PNG', optimize=True)
+    png = buf.getvalue()
+
+    if len(png) < len(jpeg):
+        encoded, ext, media_type = png, '.png', 'image/png'
+    else:
+        encoded, ext, media_type = jpeg, '.jpg', 'image/jpeg'
+
+    # Untouched pixels + a format the device reads + no size win = leave it be.
+    converted = True
+    if (_RENDERABLE_RE.search(image_path or '') and im.format in ('PNG', 'JPEG')
+            and not cropped and (final_w, final_h) == (orig_w, orig_h)
+            and len(encoded) >= orig_size):
+        converted = False
 
     meta = {
         'orig_w': orig_w, 'orig_h': orig_h, 'orig_size': orig_size,
-        'final_w': final_w, 'final_h': final_h, 'final_size': len(jpeg),
-        'cropped': cropped,
+        'final_w': final_w, 'final_h': final_h,
+        'final_size': len(encoded) if converted else orig_size,
+        'cropped': cropped, 'converted': converted,
+        'encoded_size': len(encoded),
+        'ext': ext if converted else None,
+        'media_type': media_type if converted else None,
     }
-    return jpeg, meta
+    return (encoded if converted else data), meta
 
 
 
@@ -264,14 +305,132 @@ def _decode_text(raw):
             return raw.decode('iso-8859-1', 'replace')
 
 
-def _renamed_path(path):
-    """png/gif/webp/bmp/jpeg -> .jpg (jpg stays jpg)."""
-    return RENAME_RE.sub('.jpg', path)
+# --- named entities -> numeric character references -------------------------
+#
+# The lxml round-trip below re-serializes only the root element, so a document's
+# DOCTYPE (and any internal DTD subset) is dropped. Without a DTD an XML parser
+# knows just the five entities XML predefines, so a surviving `&nbsp;` is a
+# fatal "undefined entity" error on-device. Numeric references need no DTD, so
+# every named entity is substituted for its numeric equivalent up front.
+
+_XML_ENTITIES = frozenset(('amp', 'lt', 'gt', 'quot', 'apos'))
+_ENTITY_REF_RE = re.compile(r'&([A-Za-z][A-Za-z0-9]*);')
+_DOCTYPE_SUBSET_RE = re.compile(r'<!DOCTYPE[^>\[]*\[(.*?)\]\s*>', re.DOTALL | re.IGNORECASE)
+_ENTITY_DECL_RE = re.compile(
+    r'<!ENTITY\s+([A-Za-z][A-Za-z0-9._-]*)\s+(["\'])(.*?)\2\s*>', re.DOTALL)
 
 
-def _rename_basename_refs(text):
-    """Rewrite raster-image extensions to .jpg inside hrefs/src/url() references."""
-    return REF_RE.sub('.jpg', text)
+def _build_entity_map():
+    """name -> numeric-reference replacement, for every standard HTML entity."""
+    try:
+        from html import entities
+    except ImportError:  # pragma: no cover - stdlib is always present
+        return {}
+    table = getattr(entities, 'html5', None)
+    if table:
+        pairs = [(k[:-1], v) for k, v in table.items() if k.endswith(';')]
+    else:  # older/stripped stdlib
+        pairs = [(k, chr(v))
+                 for k, v in getattr(entities, 'name2codepoint', {}).items()]
+    return {name: ''.join('&#%d;' % ord(c) for c in chars)
+            for name, chars in pairs if name not in _XML_ENTITIES}
+
+
+_ENTITY_MAP = _build_entity_map()
+
+
+def _entity_value_to_refs(value):
+    """Render a declared entity value as numeric refs (ASCII kept literal)."""
+    value = _ENTITY_REF_RE.sub(
+        lambda m: _ENTITY_MAP.get(m.group(1), m.group(0)), value)
+    return ''.join(c if ord(c) < 128 else '&#%d;' % ord(c) for c in value)
+
+
+def _internal_entity_map(text):
+    """Entities declared in the document's own internal DTD subset, if any."""
+    m = _DOCTYPE_SUBSET_RE.search(text)
+    if not m:
+        return None
+    extra = {}
+    for name, _quote, value in _ENTITY_DECL_RE.findall(m.group(1)):
+        if name not in _XML_ENTITIES:
+            extra[name] = _entity_value_to_refs(value)
+    return extra or None
+
+
+def _numericize_entities(text):
+    """Replace named entities with numeric ones (``&nbsp;`` -> ``&#160;``).
+
+    Locally declared entities win over the standard HTML table; names that are
+    neither (and the five XML entities) are left untouched.
+    Returns (text, count).
+    """
+    if '&' not in text:
+        return text, 0
+    table = _ENTITY_MAP
+    local = _internal_entity_map(text)
+    if local:
+        table = dict(table)
+        table.update(local)
+    count = [0]
+
+    def repl(m):
+        replacement = table.get(m.group(1))
+        if replacement is None:
+            return m.group(0)
+        count[0] += 1
+        return replacement
+
+    return _ENTITY_REF_RE.sub(repl, text), count[0]
+
+
+def _renamed_path(path, ext):
+    """Swap a raster path's extension for the one it was re-encoded to."""
+    return RENAME_RE.sub(ext, path)
+
+
+# --- reference rewriting ----------------------------------------------------
+#
+# Only images that were actually re-encoded are renamed, and they become either
+# ``.jpg`` or ``.png``, so a reference can no longer be rewritten on sight: each
+# one is resolved against the zip entry it points at (relative to the document
+# holding it) and rewritten only when that entry is in ``converted`` — a
+# {zip path: new extension} map.
+
+# A quoted attribute value (href/src/xlink:href) ending in a raster extension.
+_REF_ATTR_RE = re.compile(
+    r'(["\'])([^"\'<>]*\.(?:png|gif|webp|bmp|jpe?g))\1', re.IGNORECASE)
+# An unquoted CSS url(...) token.
+_REF_URL_RE = re.compile(
+    r'url\(\s*([^"\'()\s]*\.(?:png|gif|webp|bmp|jpe?g))\s*\)', re.IGNORECASE)
+
+
+def _resolve_ref(base_dir, ref):
+    """Resolve a document-relative reference to a zip entry path, or None."""
+    from urllib.parse import unquote
+    path = ref.split('#', 1)[0].split('?', 1)[0]
+    if not path or ':' in path.split('/', 1)[0]:  # absolute URL / data: URI
+        return None
+    path = unquote(path)
+    if path.startswith('/'):
+        path = path.lstrip('/')
+    elif base_dir:
+        path = posixpath.join(base_dir, path)
+    return posixpath.normpath(path)
+
+
+def _rewrite_refs(text, base_dir, converted):
+    """Rewrite raster refs, but only those pointing at re-encoded images."""
+    if not converted:
+        return text
+
+    def mapped(ref):
+        ext = converted.get(_resolve_ref(base_dir, ref))
+        return _renamed_path(ref, ext) if ext else ref
+
+    text = _REF_ATTR_RE.sub(
+        lambda m: '%s%s%s' % (m.group(1), mapped(m.group(2)), m.group(1)), text)
+    return _REF_URL_RE.sub(lambda m: 'url(%s)' % mapped(m.group(1)), text)
 
 
 def _strip_img_dims(text):
@@ -343,7 +502,7 @@ def _fix_img_style_text(tag):
                   flags=re.IGNORECASE | re.DOTALL)
 
 
-def _fix_img_element(img):
+def _fix_img_element(img, base_dir, converted):
     modified = False
     if img.get('width') is not None:
         del img.attrib['width']
@@ -360,17 +519,18 @@ def _fix_img_element(img):
             del img.attrib['style']
         modified = True
     src = img.get('src')
-    if src and RENAME_RE.search(src):
-        img.set('src', RENAME_RE.sub('.jpg', src))
+    ext = converted.get(_resolve_ref(base_dir, src)) if src else None
+    if ext:
+        img.set('src', _renamed_path(src, ext))
         modified = True
     return modified
 
 
-def _fix_xhtml(text, log):
+def _fix_xhtml(text, base_dir, converted, log):
     """Normalize image sizing, unwrap SVG covers/images, rename refs, inject CSS."""
     fixes = 0
     # SVG cover / SVG-wrapped images: unwrap to a plain <img>.
-    new_text, n = _unwrap_svg_images(text)
+    new_text, n = _unwrap_svg_images(text, base_dir, converted)
     if n:
         text = new_text
         fixes += n
@@ -383,10 +543,10 @@ def _fix_xhtml(text, log):
         if root is not None:
             modified = False
             for img in root.iter('{http://www.w3.org/1999/xhtml}img'):
-                modified |= _fix_img_element(img)
+                modified |= _fix_img_element(img, base_dir, converted)
             # also catch namespace-less <img> (malformed docs)
             for img in root.iter('img'):
-                modified |= _fix_img_element(img)
+                modified |= _fix_img_element(img, base_dir, converted)
             if modified:
                 text = etree.tostring(
                     root, encoding='unicode',
@@ -395,7 +555,7 @@ def _fix_xhtml(text, log):
                     text = '<?xml version="1.0" encoding="utf-8"?>\n' + text
     except Exception:
         # Regex fallback: rename refs and drop width/height on img tags.
-        text = _rename_basename_refs(text)
+        text = _rewrite_refs(text, base_dir, converted)
         text = _strip_img_dims(text)
 
     # Inject the defensive stylesheet just before </head>.
@@ -411,21 +571,25 @@ _SVG_IMG_RE = re.compile(
     re.IGNORECASE)
 
 
-def _unwrap_svg_images(content):
+def _unwrap_svg_images(content, base_dir, converted):
     if '<svg' not in content or 'href' not in content:
         return content, 0
     count = [0]
 
     def repl(m):
         count[0] += 1
+        href = m.group(1)
+        ext = converted.get(_resolve_ref(base_dir, href))
+        if ext:
+            href = _renamed_path(href, ext)
         return ('<img style="max-width:100%%;height:auto" src="%s" alt="" />'
-                % RENAME_RE.sub('.jpg', m.group(1)))
+                % href)
 
     new = _SVG_IMG_RE.sub(repl, content)
     return new, count[0]
 
 
-def _fix_opf(text, log):
+def _fix_opf(text, base_dir, converted, log):
     """Fix media-types for renamed images, drop svg properties, ensure cover meta."""
     try:
         from lxml import etree
@@ -447,9 +611,10 @@ def _fix_opf(text, log):
                 continue
             seen.add(id(it))
             href = it.get('href') or ''
-            if RENAME_RE.search(href):
-                it.set('href', RENAME_RE.sub('.jpg', href))
-                it.set('media-type', 'image/jpeg')
+            ext = converted.get(_resolve_ref(base_dir, href)) if href else None
+            if ext:
+                it.set('href', _renamed_path(href, ext))
+                it.set('media-type', _MEDIA_TYPES[ext])
             props = it.get('properties')
             if props and 'svg' in props.split():
                 new_props = ' '.join(p for p in props.split() if p != 'svg').strip()
@@ -464,11 +629,21 @@ def _fix_opf(text, log):
             out = '<?xml version="1.0" encoding="utf-8"?>\n' + out
         return out
     except Exception:
-        # Regex fallback.
-        text = re.sub(
-            r'(<(?:\w+:)?item\b[^>]*href="[^"]+\.jpg"[^>]*)media-type="image/(?:png|gif|webp|bmp)"',
-            r'\1media-type="image/jpeg"', text)
-        text = _rename_basename_refs(text)
+        # Regex fallback: rename converted manifest items and retype them.
+        def fix_item(m):
+            tag, href = m.group(0), m.group(1)
+            ext = converted.get(_resolve_ref(base_dir, href))
+            if not ext:
+                return tag
+            tag = tag.replace('href="%s"' % href,
+                              'href="%s"' % _renamed_path(href, ext), 1)
+            return re.sub(r'media-type="image/[^"]*"',
+                          'media-type="%s"' % _MEDIA_TYPES[ext],
+                          tag, flags=re.IGNORECASE)
+
+        text = re.sub(r'<(?:\w+:)?item\b[^>]*href="([^"]+)"[^>]*>', fix_item, text,
+                      flags=re.IGNORECASE)
+        text = _rewrite_refs(text, base_dir, converted)
         text = re.sub(r'\s+svg(?=["\'\s>])', '', text)
         return text
 
@@ -547,6 +722,16 @@ def _extract_identifier(opf_text):
 # Public entry point
 # ---------------------------------------------------------------------------
 
+def _numericize(text, name, log, summary):
+    """_numericize_entities + logging/accounting for one container file."""
+    text, count = _numericize_entities(text)
+    if count:
+        log('FIX', '%s: %d named entit%s → numeric' % (
+            os.path.basename(name), count, 'y' if count == 1 else 'ies'))
+        summary['fixes'] += 1
+    return text
+
+
 def optimize_epub(in_path, out_path, profile, opts, log_fn=None):
     """Optimize an EPUB at ``in_path``, writing the result to ``out_path``.
 
@@ -571,6 +756,7 @@ def optimize_epub(in_path, out_path, profile, opts, log_fn=None):
         'orig_size': orig_size,
         'new_size': orig_size,
         'images': 0,
+        'kept': 0,
         'cropped': 0,
         'errors': 0,
         'fixes': 0,
@@ -587,7 +773,6 @@ def optimize_epub(in_path, out_path, profile, opts, log_fn=None):
     zin = zipfile.ZipFile(in_path, 'r')
     try:
         names = zin.namelist()
-        renamed = {n: _renamed_path(n) for n in names if RENAME_RE.search(n)}
         opf_text = None
         identifier = None
 
@@ -604,50 +789,73 @@ def optimize_epub(in_path, out_path, profile, opts, log_fn=None):
                 zout.writestr('mimetype', zin.read('mimetype'),
                               compress_type=zipfile.ZIP_STORED)
 
+            # Images go first: which of them were re-encoded, and to what,
+            # decides how every reference to them is rewritten in the pass below.
+            converted = {}
             for n in names:
-                if n == 'mimetype':
+                if n == 'mimetype' or not RASTER_RE.search(n.lower()):
+                    continue
+                if zin.getinfo(n).is_dir():
+                    continue
+                data = zin.read(n)
+                try:
+                    out_data, meta = process_image(data, profile, opts, n)
+                except Exception as exc:
+                    summary['errors'] += 1
+                    log('IMG-ERR', '%s: %s (kept original)' % (
+                        os.path.basename(n), exc))
+                    zout.writestr(n, data, compress_type=zipfile.ZIP_STORED)
+                    continue
+                if meta['converted']:
+                    summary['images'] += 1
+                    if meta['cropped']:
+                        summary['cropped'] += 1
+                    converted[posixpath.normpath(n)] = meta['ext']
+                    log('IMG', '%s (%dx%d %s) → %dx%d %s %s%s' % (
+                        os.path.basename(n), meta['orig_w'], meta['orig_h'],
+                        _human(meta['orig_size']), meta['final_w'], meta['final_h'],
+                        _human(meta['final_size']), meta['ext'].lstrip('.').upper(),
+                        ' [cropped]' if meta['cropped'] else ''))
+                    zout.writestr(_renamed_path(n, meta['ext']), out_data,
+                                  compress_type=zipfile.ZIP_STORED)
+                else:
+                    summary['kept'] += 1
+                    log('IMG', '%s (%dx%d %s) kept as-is — re-encoding it '
+                               'would take %s' % (
+                                   os.path.basename(n), meta['orig_w'],
+                                   meta['orig_h'], _human(meta['orig_size']),
+                                   _human(meta['encoded_size'])))
+                    zout.writestr(n, out_data, compress_type=zipfile.ZIP_STORED)
+
+            for n in names:
+                if n == 'mimetype' or RASTER_RE.search(n.lower()):
                     continue
                 info = zin.getinfo(n)
                 if info.is_dir():
                     continue
                 low = n.lower()
+                base_dir = posixpath.dirname(n)
                 data = zin.read(n)
 
-                if RASTER_RE.search(low):
-                    try:
-                        jpeg, meta = process_image(data, profile, opts, n)
-                        summary['images'] += 1
-                        if meta['cropped']:
-                            summary['cropped'] += 1
-                        log('IMG', '%s (%dx%d %s) → %dx%d %s%s' % (
-                            os.path.basename(n), meta['orig_w'], meta['orig_h'],
-                            _human(meta['orig_size']), meta['final_w'], meta['final_h'],
-                            _human(meta['final_size']),
-                            ' [cropped]' if meta['cropped'] else ''))
-                        zout.writestr(renamed.get(n, _renamed_path(n)), jpeg,
-                                      compress_type=zipfile.ZIP_STORED)
-                    except Exception as exc:
-                        summary['errors'] += 1
-                        log('IMG-ERR', '%s: %s (kept original)' % (
-                            os.path.basename(n), exc))
-                        zout.writestr(n, data, compress_type=zipfile.ZIP_STORED)
-                elif XHTML_RE.search(low):
+                if XHTML_RE.search(low):
                     text = _decode_text(data)
-                    text, fixes = _fix_xhtml(text, log)
+                    text = _numericize(text, n, log, summary)
+                    text, fixes = _fix_xhtml(text, base_dir, converted, log)
                     summary['fixes'] += fixes
                     zout.writestr(n, text.encode('utf-8'),
                                   compress_type=zipfile.ZIP_DEFLATED)
                 elif low.endswith('.opf'):
                     before = summary['fixes']
                     text = _decode_text(data)
-                    text = _rename_basename_refs(text)
-                    text = _fix_opf(text, log)
+                    text = _numericize(text, n, log, summary)
+                    text = _fix_opf(text, base_dir, converted, log)
                     zout.writestr(n, text.encode('utf-8'),
                                   compress_type=zipfile.ZIP_DEFLATED)
                     summary['fixes'] = max(summary['fixes'], before)
                 elif low.endswith('.ncx'):
                     text = _decode_text(data)
-                    text = _rename_basename_refs(text)
+                    text = _numericize(text, n, log, summary)
+                    text = _rewrite_refs(text, base_dir, converted)
                     new_text = _sync_ncx_identifier(text, identifier)
                     if new_text != text:
                         log('FIX', 'NCX identifier synced')
@@ -655,8 +863,8 @@ def optimize_epub(in_path, out_path, profile, opts, log_fn=None):
                     zout.writestr(n, new_text.encode('utf-8'),
                                   compress_type=zipfile.ZIP_DEFLATED)
                 elif low.endswith('.css'):
-                    text = _decode_text(data)
-                    zout.writestr(n, _rename_basename_refs(text).encode('utf-8'),
+                    text = _rewrite_refs(_decode_text(data), base_dir, converted)
+                    zout.writestr(n, text.encode('utf-8'),
                                   compress_type=zipfile.ZIP_DEFLATED)
                 else:
                     zout.writestr(n, data, compress_type=zipfile.ZIP_DEFLATED)
@@ -675,8 +883,10 @@ def optimize_epub(in_path, out_path, profile, opts, log_fn=None):
     summary['elapsed'] = time.time() - start
     saved = orig_size - summary['new_size']
     pct = (saved / float(orig_size) * 100.0) if orig_size else 0.0
-    log('DONE', 'Optimized %d image(s), %d fix(es) — %s → %s (%+.0f%%) in %.1fs' % (
-        summary['images'], summary['fixes'], _human(orig_size),
+    log('DONE', 'Optimized %d image(s)%s, %d fix(es) — %s → %s (%+.0f%%) in %.1fs' % (
+        summary['images'],
+        (' (%d already optimal)' % summary['kept']) if summary['kept'] else '',
+        summary['fixes'], _human(orig_size),
         _human(summary['new_size']), -pct, summary['elapsed']))
     return summary
 

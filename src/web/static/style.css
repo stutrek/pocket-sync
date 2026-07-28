@@ -103,12 +103,6 @@ body {
 main {
   padding: 16px;
 }
-.view {
-  display: none;
-}
-.view.active {
-  display: block;
-}
 
 .toolbar {
   display: flex;
@@ -157,9 +151,6 @@ button:disabled {
   opacity: .5;
   cursor: default;
 }
-.hidden {
-  display: none !important;
-}
 .muted {
   color: var(--muted);
   font-size: 13px;
@@ -168,45 +159,21 @@ button:disabled {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  color: var(--muted);
+  cursor: pointer;
+}
+.check input[type="checkbox"] {
+  accent-color: var(--accent);
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  flex: none;
 }
 
-.dropzone {
-  border: 2px dashed var(--border);
-  border-radius: var(--radius);
-  padding: 18px;
-  text-align: center;
-  color: var(--muted);
-  margin-bottom: 12px;
-}
-.dropzone.hot {
-  border-color: var(--accent);
-  color: var(--accent);
-}
-
-.upload-queue {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  margin-bottom: 12px;
-}
-.upload-row {
-  display: flex;
-  gap: 8px;
-  align-items: center;
-  font-size: 13px;
-}
-.upload-row .name {
-  flex: 1;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
+/* Small covers: the shelf is for finding a book among many, not admiring one. */
 .grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
-  gap: 14px;
+  grid-template-columns: repeat(auto-fill, minmax(100px, 1fr));
+  gap: 10px;
 }
 
 .card {
@@ -223,7 +190,8 @@ button:disabled {
   box-shadow: 0 0 0 1px var(--accent);
 }
 .card .cover {
-  height: 190px;
+  /* A ratio rather than a height: the column width is what varies. */
+  aspect-ratio: 2 / 3;
   background: var(--bg);
   display: flex;
   align-items: center;
@@ -240,27 +208,72 @@ button:disabled {
   font-size: 28px;
 }
 .card .meta {
-  padding: 8px 10px;
+  padding: 6px 7px;
+  min-width: 0;
 }
+/* Two lines of title, then ellipsis — a card is an identifier, not a record. */
 .card .title {
   font-weight: 600;
-  font-size: 13px;
+  font-size: 12px;
+  line-height: 1.25;
   margin-bottom: 2px;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 .card .author {
   color: var(--muted);
-  font-size: 12px;
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .card .badges {
   display: flex;
-  gap: 4px;
+  gap: 3px;
   flex-wrap: wrap;
-  margin-top: 6px;
+  margin-top: 4px;
 }
+/* Top left belongs to the sync dot, so selection takes the other corner. */
 .card input[type="checkbox"] {
   position: absolute;
   top: 8px;
-  left: 8px;
+  right: 8px;
+  z-index: 2;
+}
+
+/* Is this book on my reader? Green yes, orange on its way, grey no. The ring
+   keeps it legible over any cover art. */
+.sync-dot {
+  position: absolute;
+  top: 6px;
+  left: 6px;
+  z-index: 1;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--muted);
+  box-shadow: 0 0 0 2px var(--panel);
+}
+
+.sync-dot.synced {
+  background: var(--ok);
+}
+
+.sync-dot.pending {
+  background: var(--warn);
+}
+
+/* Uploading right now: the same "on its way" colour, but visibly moving. */
+.sync-dot.sending {
+  animation: dot-pulse 1.1s ease-in-out infinite;
+}
+
+@keyframes dot-pulse {
+  50% {
+    opacity: .35;
+  }
 }
 
 .badge {
@@ -269,10 +282,6 @@ button:disabled {
   border-radius: 10px;
   border: 1px solid var(--border);
   color: var(--muted);
-}
-.badge.on-device {
-  border-color: var(--ok);
-  color: var(--ok);
 }
 .badge.online {
   border-color: var(--ok);
@@ -304,22 +313,6 @@ button:disabled {
   font-size: 16px;
 }
 
-.list-index {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-}
-.list-index li {
-  padding: 6px 8px;
-  border-radius: var(--radius);
-  cursor: pointer;
-  display: flex;
-  justify-content: space-between;
-}
-.list-index li.active {
-  background: var(--bg);
-}
-
 .table {
   width: 100%;
   border-collapse: collapse;
@@ -336,22 +329,246 @@ button:disabled {
   font-weight: 500;
 }
 
-.device {
+/* One line of "what is happening", clickable through to the Activity tab. */
+.activity-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  text-align: left;
+  padding: 7px 10px;
+  margin-bottom: 10px;
+  font-size: 13px;
+}
+
+.activity-bar.warn {
+  border-color: var(--warn);
+  color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 10%, var(--panel));
+}
+
+.activity-label {
+  flex: 0 0 auto;
+}
+
+.activity-track {
+  flex: 1;
+  height: 4px;
+  min-width: 60px;
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--muted) 30%, transparent);
+  overflow: hidden;
+}
+
+.activity-fill {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  transition: width .2s linear;
+}
+
+/* No measurable amount to show — a stage, not a fraction. */
+.activity-fill.indeterminate {
+  width: 40%;
+  animation: activity-slide 1.4s ease-in-out infinite;
+}
+
+@keyframes activity-slide {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(250%);
+  }
+}
+
+/* A pill that carries its detail in a tooltip says so. */
+.badge.has-detail {
+  cursor: help;
+  border-style: dashed;
+}
+
+/* Our own tooltip: the OS one cannot be styled, is slow, and never opens from
+   the keyboard. Hover or focus the host; no JS state to get stuck. */
+.tip-host {
+  position: relative;
+  display: inline-flex;
+  outline: none;
+}
+
+.tip {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 40;
+  display: none;
+  min-width: 240px;
+  padding: 8px 10px;
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  padding: 12px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, .18);
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text);
+  white-space: nowrap;
+  cursor: default;
+}
+
+.tip-host:hover .tip,
+.tip-host:focus-visible .tip,
+.tip-host:focus-within .tip {
+  display: block;
+}
+
+.tip-row {
+  display: flex;
+  gap: 12px;
+}
+
+.tip-key {
+  color: var(--muted);
+  flex: 0 0 96px;
+}
+
+.tip-val {
+  flex: 1;
+  text-align: right;
+}
+
+/* Books the reader has that no folder accounts for. */
+.strays .caret {
+  font-weight: 600;
+  font-size: 14px;
+}
+
+.stray-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font-size: 13px;
+}
+
+.stray-list li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 0;
+  border-top: 1px solid var(--border);
+}
+
+.stray-list .name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.scrim {
+  position: fixed;
+  inset: 0;
+  background: color-mix(in srgb, #000 45%, transparent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  z-index: 60;
+}
+
+.modal {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+  width: 460px;
+  max-width: 100%;
+  max-height: 90vh;
+  overflow: auto;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, .3);
+}
+
+.modal header {
+  display: flex;
+  align-items: center;
   margin-bottom: 12px;
 }
-.device header {
+
+.modal header h2 {
+  margin: 0;
+  font-size: 16px;
+}
+
+/* A 460px modal cannot spare the 220px label column the Settings pane needs —
+   the labels in here are one or two words, and the controls are what the dialog
+   is for. */
+.modal .form {
+  grid-template-columns: 110px minmax(0, 1fr);
+  align-items: center;
+}
+
+/* An action with its own explanation, in the body where it belongs. */
+.modal-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 0;
+  border-top: 1px solid var(--border);
+}
+
+.modal-row .muted.small {
+  max-width: 34ch;
+}
+
+.modal-actions {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin-bottom: 8px;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
 }
-.device header h3 {
+
+.badge.warn-badge {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+
+.advanced {
+  margin: 2px 0 6px;
+}
+
+.advanced summary {
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.advanced .rule {
+  padding: 8px 0 4px;
+}
+
+/* One person's or one reader's page: a header of controls, then their shelf. */
+.scope-view {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.scope-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 4px;
+}
+.scope-head h2 {
   margin: 0;
   font-size: 15px;
+}
+/* Keep the person picker on the same baseline as the buttons beside it. */
+.scope-head select,
+.scope-head button {
+  height: 32px;
+  padding-top: 0;
+  padding-bottom: 0;
 }
 .rule {
   display: flex;
@@ -359,21 +576,75 @@ button:disabled {
   flex-wrap: wrap;
   align-items: flex-end;
 }
+/* A fixed control height keeps the labels of neighbouring fields on one line —
+   otherwise a short control (a bare <select>) drops its label below the rest. */
+.rule input:not([type="checkbox"]),
+.rule select,
+.rule button {
+  height: 32px;
+}
 .field {
   display: flex;
   flex-direction: column;
   gap: 3px;
+  min-width: 0;
+}
+.field input,
+.field select {
+  width: 100%;
+}
+.field.grow {
+  flex: 1;
+  min-width: 140px;
+}
+.field.narrow {
+  width: 110px;
+  flex: none;
 }
 .field label {
   font-size: 12px;
   color: var(--muted);
 }
 
+.profile {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px;
+  margin-bottom: 10px;
+}
+.profile .checks {
+  display: flex;
+  gap: 8px 18px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+}
+.profile .actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+
+/* `minmax(0, 1fr)`, not `1fr`: a grid track's automatic minimum is its content's
+   min-content width, and a <select> reports that as its *longest option string*.
+   One long option would otherwise stretch the column, and with it the fixed-width
+   modal this grid sits in — the control has to be allowed to be narrower than
+   its widest choice. */
 .form {
   display: grid;
-  grid-template-columns: 220px 1fr;
+  grid-template-columns: 220px minmax(0, 1fr);
   gap: 8px 12px;
   align-items: center;
+}
+
+/* Same reason, one level down: a control nested in a wrapper inside the cell. */
+.form select,
+.form input,
+.form textarea {
+  max-width: 100%;
 }
 .form label {
   color: var(--muted);
@@ -383,19 +654,6 @@ button:disabled {
   grid-column: 1 / -1;
   margin: 12px 0 0;
   font-size: 14px;
-}
-
-.progress {
-  height: 4px;
-  background: var(--border);
-  border-radius: 2px;
-  overflow: hidden;
-  width: 120px;
-}
-.progress > div {
-  height: 100%;
-  background: var(--accent);
-  width: 0;
 }
 
 .logs {
@@ -514,4 +772,328 @@ button:disabled {
 .banner button {
   padding: 3px 9px;
   font-size: 12px;
+}
+
+/* --- watched folders, rail and inbox (docs/DESIGN.md) --------------------- */
+
+.rail {
+  flex: 0 0 210px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.rail-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.rail-list li {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: var(--radius);
+  cursor: pointer;
+}
+
+.rail-list li:hover {
+  background: var(--bg);
+}
+
+.rail-list li.active {
+  background: var(--bg);
+  font-weight: 600;
+}
+
+/* Library, then the people it is for, then their readers — the rail is the
+   concept map, so the nesting has to be visible. */
+.rail-tree > li + li {
+  margin-top: 2px;
+}
+
+/* Qualified with .rail-list because that rule makes every li a flex row, which
+   would otherwise lay a person's readers out beside their name instead of under
+   it. */
+.rail-list li.rail-person {
+  display: block;
+  padding: 0;
+  cursor: default;
+}
+
+.rail-list li.rail-person:hover {
+  background: none;
+}
+
+.rail-row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 6px 8px;
+  margin-top: 6px;
+  border-radius: var(--radius);
+  cursor: pointer;
+}
+
+.rail-row:hover {
+  background: var(--bg);
+}
+
+.rail-row.active {
+  background: var(--bg);
+  font-weight: 600;
+}
+
+.rail-row.muted {
+  cursor: default;
+  font-size: 12px;
+}
+
+.rail-person .rail-list {
+  padding-left: 10px;
+}
+
+.rail-list li.rail-device {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 6px;
+  font-size: 13px;
+}
+
+/* The reader's name is the point of the row; the pending count must not push it
+   onto a second line in a 210px rail. */
+.rail-device .name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Imports can block on the user, so this is a place things wait. */
+.inbox {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel);
+  margin-bottom: 14px;
+  overflow: hidden;
+}
+
+.inbox-head {
+  display: flex;
+  justify-content: space-between;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.inbox-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border-top: 1px solid var(--border);
+}
+
+.inbox-row:first-of-type {
+  border-top: none;
+}
+
+.inbox-row .name {
+  font-weight: 500;
+  max-width: 40%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.inbox-row.blocked {
+  background: color-mix(in srgb, var(--warn) 10%, transparent);
+}
+
+.inbox-row.failed {
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
+}
+
+.inbox-row .ok {
+  color: var(--ok);
+}
+
+.inbox-row .err {
+  color: var(--danger);
+}
+
+.inbox-row .warn {
+  color: var(--warn);
+}
+
+/* Reading progress sits on the cover — the shelf's most useful signal. */
+.read-bar {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 3px;
+  background: color-mix(in srgb, var(--muted) 35%, transparent);
+}
+
+.read-bar > div {
+  height: 100%;
+  background: var(--accent);
+}
+
+.card .cover {
+  position: relative;
+}
+
+.badge.finished {
+  color: var(--ok);
+  border-color: var(--ok);
+}
+
+/* Books land in a folder, so the dropzone is one folder section — revealed
+   only while dragging over it. */
+.drop-overlay {
+  position: absolute;
+  inset: 0;
+  border-radius: var(--radius);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  border: 3px dashed var(--accent);
+  pointer-events: none;
+  z-index: 50;
+}
+
+.folders {
+  margin-bottom: 20px;
+}
+
+.folder-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 0;
+  border-top: 1px solid var(--border);
+}
+
+.small {
+  font-size: 12px;
+}
+
+.plan {
+  margin: 6px 0;
+}
+
+.danger-text {
+  color: var(--danger);
+}
+
+.reading {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.drawer-lib {
+  border-top: 1px solid var(--border);
+  padding: 8px 0;
+}
+
+.warn {
+  color: var(--warn);
+}
+
+/* --- the shelf: one collapsible section per watched folder ---------------- */
+
+.shelf {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.folder-group {
+  position: relative;
+  border-top: 1px solid var(--border);
+  padding: 8px 0 12px;
+}
+
+.folder-group:first-child {
+  border-top: none;
+}
+
+/* A folder that doesn't sync here is context, not the subject of the page. */
+.folder-group.unbound .folder-head .caret {
+  color: var(--muted);
+}
+
+.folder-group.hot {
+  background: color-mix(in srgb, var(--accent) 6%, transparent);
+}
+
+.folder-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.folder-head .caret {
+  font-weight: 600;
+  font-size: 14px;
+  text-decoration: none;
+  color: var(--text);
+}
+
+.folder-head .caret:hover {
+  color: var(--accent);
+}
+
+.folder-head .check {
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.folder-row code {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 2px 6px;
+}
+
+/* One person's sync servers. Indented so a household of three reads as three
+   lists rather than one long one. */
+.server-group {
+  margin: 4px 0 16px;
+  padding-left: 12px;
+  border-left: 2px solid var(--border);
+}
+
+.server-group h3 {
+  margin: 8px 0 0;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.server-group .badge {
+  margin-left: 6px;
+}
+
+.crumbs {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  padding: 6px 0;
+}
+
+button.link {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--accent);
+  cursor: pointer;
+  font: inherit;
+  text-decoration: underline;
 }

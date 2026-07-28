@@ -101,6 +101,84 @@ def cmd_optimize(args, emit):
     return summary
 
 
+def cmd_stamp(args, _emit):
+    """Record the source MD5 inside a delivered EPUB's OPF metadata.
+
+    On-device filenames are human readable, so the name can no longer carry the
+    book id. This stamp is how a file found on a reader is matched back to a
+    book, and it survives the user renaming it there (docs/DESIGN.md).
+    """
+    import re
+    import zipfile
+
+    path = args["path"]
+    md5 = args["md5"]
+    tag = '<meta name="pocketsync-source-md5" content="%s"/>' % md5
+
+    with zipfile.ZipFile(path, "r") as zf:
+        names = zf.namelist()
+        try:
+            container = zf.read("META-INF/container.xml").decode("utf-8", "replace")
+        except KeyError:
+            return {"stamped": False, "reason": "no container.xml"}
+        match = re.search(r'full-path="([^"]+)"', container)
+        if not match:
+            return {"stamped": False, "reason": "no rootfile"}
+        opf_name = match.group(1)
+        if opf_name not in names:
+            return {"stamped": False, "reason": "rootfile missing"}
+        opf = zf.read(opf_name).decode("utf-8", "replace")
+        entries = [(info, zf.read(info.filename)) for info in zf.infolist()]
+
+    if "pocketsync-source-md5" in opf:
+        opf = re.sub(
+            r'<meta name="pocketsync-source-md5"[^>]*/>', tag, opf, count=1
+        )
+    elif "</metadata>" in opf:
+        opf = opf.replace("</metadata>", tag + "</metadata>", 1)
+    else:
+        return {"stamped": False, "reason": "no metadata element"}
+
+    tmp = path + ".stamp"
+    # `mimetype` must stay first and uncompressed for a valid EPUB.
+    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as out:
+        for info, data in entries:
+            if info.filename == "mimetype":
+                out.writestr(info, data, compress_type=zipfile.ZIP_STORED)
+                break
+        for info, data in entries:
+            if info.filename == "mimetype":
+                continue
+            payload = opf.encode("utf-8") if info.filename == opf_name else data
+            out.writestr(info, payload)
+    os.replace(tmp, path)
+    return {"stamped": True, "opf": opf_name}
+
+
+def cmd_extract(args, _emit):
+    """Pull the first member matching a pattern out of a zip.
+
+    Used to get the inner plugin zip out of a Calibre plugin release bundle.
+    """
+    import fnmatch
+    import zipfile
+
+    path = args["path"]
+    pattern = args.get("pattern", "*")
+    out_dir = args["outDir"]
+    with zipfile.ZipFile(path, "r") as zf:
+        for name in zf.namelist():
+            if name.endswith("/"):
+                continue
+            if not fnmatch.fnmatch(os.path.basename(name), pattern):
+                continue
+            target = os.path.join(out_dir, os.path.basename(name))
+            with zf.open(name) as src, open(target, "wb") as dst:
+                dst.write(src.read())
+            return {"extracted": target}
+    return {"extracted": None}
+
+
 def cmd_discover(args, emit):
     _optimizer, ws_client = _vendor()
     host, port = ws_client.discover_device(
@@ -153,6 +231,8 @@ class SidecarError(Exception):
 COMMANDS = {
     "ping": cmd_ping,
     "optimize": cmd_optimize,
+    "stamp": cmd_stamp,
+    "extract": cmd_extract,
     "discover": cmd_discover,
     "upload": cmd_upload,
 }

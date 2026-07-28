@@ -25,6 +25,70 @@ export interface DeviceStatus {
   [k: string]: unknown;
 }
 
+/**
+ * The reader's own KOReader Sync client, as its settings page writes it.
+ *
+ * `koMatchMethod` is how the reader identifies a book to the sync server:
+ * **1 = binary** (a hash of the file it holds), **0 = filename**.
+ */
+export interface DeviceKosyncSettings {
+  koUsername: string;
+  koPassword: string;
+  koServerUrl: string;
+  koMatchMethod: number;
+}
+
+/**
+ * One OPDS catalog as the reader reports it. The reader is an OPDS *client*:
+ * these are the shelves it can browse and pull books from itself.
+ */
+export interface DeviceOpdsCatalog {
+  /** Slot number, and the handle for editing this entry in place. */
+  index: number;
+  name: string;
+  url: string;
+  username: string;
+  /** `title_author` and `author_title` are both known good. */
+  filenameFormat: string;
+  /** Whether a password is stored — never the password itself. */
+  hasPassword?: boolean;
+}
+
+export interface DeviceOpdsCatalogInput {
+  name: string;
+  url: string;
+  username: string;
+  filenameFormat: string;
+  /** Omit on an edit to keep whatever is stored. */
+  password?: string;
+  /** Omit to append a new catalog; include to overwrite that slot. */
+  index?: number;
+}
+
+/**
+ * Reduce `/api/settings` to a flat `key → value` map.
+ *
+ * Firmware 1.4.0 answers with an array of descriptors —
+ * `[{key, name, category, type, value, options?}, …]` — not the flat object the
+ * settings *write* takes. An array is still `typeof "object"`, so reading a
+ * field straight off the response silently yields `undefined` for every key,
+ * which reads as "the reader kept nothing" and turns a successful write into a
+ * reported failure. Both shapes are accepted because the flat one is what older
+ * notes recorded and what the simulator used to send.
+ */
+export function flattenSettings(body: unknown): Record<string, unknown> | null {
+  if (Array.isArray(body)) {
+    const out: Record<string, unknown> = {};
+    for (const row of body) {
+      if (row && typeof row === "object" && typeof (row as { key?: unknown }).key === "string") {
+        out[(row as { key: string }).key] = (row as { value?: unknown }).value;
+      }
+    }
+    return out;
+  }
+  return body && typeof body === "object" ? body as Record<string, unknown> : null;
+}
+
 /** Device paths are forward-slash with a single leading slash. */
 export function normalizeDevicePath(p: string): string {
   if (!p) return "";
@@ -82,6 +146,70 @@ export class DeviceClient {
     } catch {
       return false;
     }
+  }
+
+  /**
+   * The reader's current settings, or null if this firmware won't say.
+   *
+   * A probe, not a fetch: it exists so we can tell "already pointed at us" and
+   * "pointed at somebody else's sync server" apart before writing, and every
+   * caller has to work without it, because whether the endpoint reads as well
+   * as writes is not something we can promise across firmware versions.
+   */
+  async settings(timeoutMs = 6000): Promise<Record<string, unknown> | null> {
+    try {
+      const res = await this.#fetch("/api/settings", undefined, timeoutMs);
+      return flattenSettings(await res.json());
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * The OPDS catalogs this reader knows about.
+   *
+   * `index` is the slot, and it is how an entry is edited rather than
+   * duplicated. `hasPassword` is a boolean, not the password: the firmware
+   * never reads one back, so whether the stored password is still the one we
+   * sent is not a question this endpoint can answer.
+   */
+  async opdsCatalogs(timeoutMs = 6000): Promise<DeviceOpdsCatalog[] | null> {
+    try {
+      const res = await this.#fetch("/api/opds", undefined, timeoutMs);
+      const body = await res.json();
+      return Array.isArray(body) ? body as DeviceOpdsCatalog[] : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Add a catalog, or edit one in place.
+   *
+   * Include `index` to overwrite that slot, omit it to append — that is the
+   * whole difference, and getting it wrong appends a duplicate on every sync.
+   * Omitting `password` on an edit keeps the stored one.
+   */
+  async saveOpdsCatalog(entry: DeviceOpdsCatalogInput): Promise<void> {
+    const res = await this.#fetch("/api/opds", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(entry),
+    }, 12_000);
+    await res.body?.cancel();
+  }
+
+  /**
+   * Write settings, as the reader's own web UI does: a JSON body carrying only
+   * the fields being changed. Everything not named is left alone.
+   */
+  async writeSettings(patch: Record<string, unknown>): Promise<void> {
+    const res = await this.#fetch("/api/settings", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(patch),
+    }, 12_000);
+    await res.body?.cancel();
   }
 
   async listDir(path = "/"): Promise<DeviceFile[]> {

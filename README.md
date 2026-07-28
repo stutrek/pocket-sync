@@ -1,8 +1,13 @@
 # Pocket Sync
 
 A self-hosted book-sync daemon for **Xteink X3/X4** e-readers running **CrossInk / CrossPoint**
-firmware. It keeps a personal library and pushes books — resampled for the low-memory device — to
-the reader whenever it appears on Wi-Fi. One macOS menu-bar app is both the daemon and the UI.
+firmware. Point it at a folder of books and that folder _is_ your reader's library — resampled for
+the low-memory device and pushed whenever the reader appears on Wi-Fi. One macOS menu-bar app is
+both the daemon and the UI.
+
+**The filesystem is the source of truth.** Pocket Sync indexes your folder in place and never writes
+to it; add a file and it syncs, remove one and it comes off the reader. See
+[docs/DESIGN.md](docs/DESIGN.md) for the model and the reasoning behind it.
 
 It is not a Calibre replacement. It drives Calibre's `ebook-convert` for format conversion and
 reuses the CrossPoint plugin's optimizer and protocol client verbatim (see
@@ -11,7 +16,7 @@ reuses the CrossPoint plugin's optimizer and protocol client verbatim (see
 ```
         ┌──────────────── PocketSync.app (one Deno process) ───────────────┐
         │  menu-bar tray  ·  window  ·  HTTP + web UI  ·  SQLite           │
-browser ┤  library / lists / ingest  →  resample cache  →  sync engine     │
+browser ┤  watched folders → ingest → resample cache → sync engine        │
         │  device manager: UDP discovery, /api/*, WebSocket upload         │
         └───────────────────────────┬─────────────────────────────────────┘
                                     │ Wi-Fi
@@ -55,32 +60,51 @@ deno task dev         # headless daemon + web UI on http://127.0.0.1:8787
 deno task desktop     # menu-bar app, built and run from source
 ```
 
+### Choosing your books folder
+
+On first run, pick the one folder that holds your books — Pocket Sync opens your system's folder
+chooser. Everything it watches lives inside that folder, and you tick which folders within it to
+sync.
+
+There is deliberately no way to type a path. Indexed files are readable and deletable through the
+API, so accepting an arbitrary path would make it an arbitrary-file API — a real concern if you ever
+set `webHost` to `0.0.0.0`. Choosing the root only works from the machine the app runs on; a browser
+elsewhere on your network can tick and untick folders but can never point it somewhere new.
+
 ### Connecting the reader
 
 UDP broadcast discovery is tried first, but many networks block it. If the reader doesn't show up
-under **Devices**, put its IP in **Settings → Discovery → manual hosts** — that path is first-class
-and needs no broadcast. A manual host may include a non-default HTTP port (`192.168.1.50:8080`); the
-upload port comes from discovery, from `/api/status`, or defaults to 81.
+under **Settings → Readers**, put its IP in **Settings → Discovery → manual hosts** — that path is
+first-class and needs no broadcast. A manual host may include a non-default HTTP port
+(`192.168.1.50:8080`); the upload port comes from discovery, from `/api/status`, or defaults to 81.
 
-Then set the device's sync rule: **source** (whole library or one list), **mode** (`add new` or
-`mirror`), and a **resampling profile**. With auto-sync on, waking the reader syncs it.
+A reader appears in the library rail under whoever is holding it. Open it there, say who that is,
+and tick the folders it should carry — or tick them on the person, which applies to every reader
+they hold. Resampling defaults to the reader's model, so there is nothing to choose unless you want
+to. With auto-sync on, waking the reader makes it match those folders.
 
 ## How syncing works
 
-1. Device answers `/api/status` → identity and model (X3/X4).
-2. `/api/files` is walked recursively for what's already there.
-3. Desired set comes from the rule; `new = desired − on device`.
-4. Each new book is converted to EPUB (once, at ingest) and optimized for the profile (once, cached
-   as `opt-<hash>.epub`), then uploaded over WebSocket in ≤2048-byte frames.
-5. `mirror` also deletes books that left the source.
+1. Each watched folder is scanned; a file's **MD5 is its book id**, cached against
+   `(path, size, mtime)` so a rescan only rehashes what changed.
+2. Device answers `/api/status` → identity and model (X3/X4).
+3. `/api/files` is walked recursively for what's already there.
+4. `send = folders − on device`, `remove = on device − folders`, where "folders" is the union of
+   every folder bound to that reader.
+5. Each new book is converted to EPUB (once) and optimized for the profile (once, cached as
+   `opt-<hash>.epub`), then uploaded over WebSocket in ≤2048-byte frames.
 
 Details worth knowing:
 
-- **Book identity on the device** is the filename `<bookId>__<title>.epub`, so a lost database can
-  be reconstructed from the device listing alone. The local manifest is preferred; filenames are the
-  fallback.
-- **`mirror` only deletes what Pocket Sync put there** — files it doesn't recognise are left alone
-  and logged. Side-loaded books survive a mirror sync.
+- **Identity is the file's content**, so renaming or moving a book in your folder is a no-op, and
+  the same file in two folders is one book sharing one optimized copy.
+- **Device filenames are readable** — `Title - Author.epub`. The source MD5 is stamped into the
+  delivered EPUB's OPF metadata, so a file found on a reader can still be matched to a book.
+- **Only files Pocket Sync put there are ever deleted** — side-loaded books survive.
+- **Bulk deletions ask first.** Removing more than five books in one sync pauses for confirmation,
+  and a folder that is missing or unreadable aborts the sync entirely rather than being read as
+  "zero books" — including when only one of several bound folders is away. An unplugged drive can't
+  wipe your reader.
 - **Device identity** comes from a stable field in `/api/status` (`uuid`, `serial`, …) so DHCP can
   move the reader freely. If the firmware exposes nothing stable, the device is bound by address and
   the UI says so; rename it and it stays put as long as there's only one reader of that model.
@@ -88,6 +112,110 @@ Details worth knowing:
   deleted, then retried with backoff), and the remaining books go out on the next connection.
 - **Optimization is cached per profile**, keyed on every setting that changes the output _and_ on
   the vendored engine version, so bumping the engine invalidates stale copies automatically.
+
+## Reading progress
+
+CrossPoint firmware includes a KOReader sync client, so Pocket Sync can be its server and learn how
+far you have read. It is on by default and sets itself up: say who is holding a reader on that
+reader's page, and its address and credentials are written to the reader the next time it syncs.
+
+The reader keeps whatever you set up yourself — if it already reports to another sync server, Pocket
+Sync leaves it alone and the reader's page offers to take it over. To do it by hand, open **Settings
+→ System → KOReader Sync** on the reader and enter the address and credentials shown in Settings.
+
+Progress arrives when you tap _Sync Progress_ on the device — it is not continuous. A book past 99%
+is tagged **finished**; you can also set or clear that by hand, and your choice outranks the reader.
+
+The sync listener binds separately from the library UI, so enabling it does not put your library on
+the network. `webHost` stays `127.0.0.1` unless you change it.
+
+## Browsing the library from a reader (OPDS)
+
+Pocket Sync can also publish the library as an **OPDS catalog**, so a reader or a phone can come and
+fetch a book instead of waiting to be sent one. Turn it on in Settings; it is off by default, and it
+binds its own port (8789) rather than sharing the library UI's.
+
+Each reader gets its own catalog address, and CrossPoint firmware has an OPDS browser built in, so
+Pocket Sync adds itself to the reader's catalog list for you — no typing on the e-ink keyboard. It
+edits its own entry rather than adding another one each time, and any catalog you added yourself is
+left alone. The device is part of that address, and that is what makes it safe: a book pulled
+through it arrives already resampled for that reader, out of the same cache the normal sync uses,
+and page sync still recognises it. Any other OPDS client — KOReader on a phone, Calibre, Thorium —
+can use the plain address instead and will get the original file; add `?profile=<id>` if you want a
+resampled one.
+
+There is no password. Sign in as anybody if your client insists, or add `?user=<your name>` to see
+your own reading progress; the password is ignored either way. That is a deliberate trade for a home
+network, and it has a real consequence worth knowing before you switch it on: **anything that can
+reach that port can download your books.** Nothing there can write, delete, or see anything outside
+the folders you already watch — but if that is not a trade you want, leave it off.
+
+## Books you already have
+
+If your books are already in **Calibre**, **Adobe Digital Editions**, **Apple Books** or **Kobo
+desktop**, Pocket Sync finds those libraries and offers to watch them where they are. Nothing is
+copied and nothing is moved: buy a book in Calibre and it appears here on its own.
+
+**Look inside** first tells you what you'd actually be adding — how many books, how many are
+protected, and whether anything needs setting up — before anything is watched.
+
+These libraries are **read-only, always**. Pocket Sync never writes into one, and _Delete file_ is
+not offered for their books; the files belong to the app that made them. Un-watching a source
+removes it from Pocket Sync and deletes nothing. Because they sit outside your books folder, the
+whole panel only works on the machine running Pocket Sync — a browser elsewhere on your network
+can't see or enable them.
+
+Three things worth knowing: Apple Books store purchases use FairPlay and cannot be opened by
+anything Pocket Sync can drive (only books you added yourself will import); Kobo `.kepub` files need
+Calibre's Obok plugin rather than DeDRM; and **Kindle for Mac/PC is deliberately not offered** —
+Amazon's current KFX DRM cannot be removed by any available tool, so the honest answer is to add
+those books to Calibre, which is supported.
+
+## DRM
+
+DRM removal runs inside **your own Calibre**, never inside Pocket Sync — DeDRM is a Calibre
+file-type plugin that only fires on `calibredb add`. Pocket Sync detects a protected file itself,
+routes it through `calibredb` into a throwaway library, and takes the cleaned result.
+
+If you already set DeDRM up in Calibre, nothing more is needed. Otherwise the Inbox walks you
+through whatever is actually missing:
+
+| What it says                       | What to do                                                      |
+| ---------------------------------- | --------------------------------------------------------------- |
+| _needs the DeDRM plugin_           | **Install plugin** — fetched from GitHub into your Calibre      |
+| _the DeDRM plugin is switched off_ | Enable it in Calibre → Preferences → Plugins                    |
+| _no key that opens this book_      | **Add a key** — see below                                       |
+| _none of your keys open it_        | The book was bought on a different account; nothing will fix it |
+| _Calibre is open_                  | Quit Calibre — it locks its database and `calibredb` cannot run |
+
+### Which key do you need?
+
+It depends where the book came from, and **a Kindle serial number is not a general-purpose key**:
+
+- **Books downloaded by Kindle for Mac or PC** are encrypted to the app installed on this machine,
+  not to any serial. DeDRM finds that key itself the first time it meets one of those books, so
+  there is usually nothing to do.
+- **Books transferred to an e-ink Kindle over USB** are encrypted to _that specific device_, so they
+  need that device's own 16-character serial (on the reader, under Settings → Device Info). A serial
+  from a different Kindle will never work, and it will not help with a book the desktop app
+  downloaded.
+- **Adobe Digital Editions** books need nothing: DeDRM finds that key itself.
+
+Keys live in Calibre's own configuration and only there. Pocket Sync can _add_ a Kindle serial to
+it, and lists what is configured under **Settings → Reader keys**, but stores nothing itself and
+never sends a key anywhere. Those screens are only available on the machine running Pocket Sync,
+even if you have opened the web UI to your network.
+
+### Kindle KFX
+
+Books the Kindle desktop app downloads use **KFX**, and its DRM cannot be removed by any available
+tool. Tested end to end against a real library: DeDRM fails with _"Unknown type encountered in
+envelope, expected VoucherEnvelope"_ — its last release predates the format and the project has been
+dormant since 2024. No key, serial or plugin changes this.
+
+So Pocket Sync does not offer the Kindle app as a library, and a `.kfx` file dropped in a watched
+folder is listed in the Inbox with that explanation rather than being silently ignored. If your
+Kindle books are already usable, they are almost certainly in Calibre — point Pocket Sync at that.
 
 ## Resampling profiles
 
@@ -111,9 +239,13 @@ GET /api/books/<id>/optimized?profile=<profileId>
 
 ## Vendored engine
 
-`engine/vendor/crosspoint_reader/` holds **unmodified** upstream files from
-[crosspoint-reader/calibre-plugins](https://github.com/crosspoint-reader/calibre-plugins) (MIT),
-pinned by commit in `engine/fetch_vendor.sh`:
+`engine/vendor/crosspoint_reader/` holds **unmodified** third-party files (MIT), pinned by commit in
+`engine/fetch_vendor.sh`. They currently come from
+[stutrek/calibre-plugins](https://github.com/stutrek/calibre-plugins) — a fork of
+[crosspoint-reader/calibre-plugins](https://github.com/crosspoint-reader/calibre-plugins) carrying
+two fixes: images are encoded as PNG when that beats JPEG (forcing JPEG made flat artwork ~6×
+larger), and named HTML entities are replaced with numeric ones (the rewrite drops the DOCTYPE that
+declared them). Both are meant to go upstream, after which the pin moves back.
 
 | File           | Used for                                  |
 | -------------- | ----------------------------------------- |
@@ -126,6 +258,7 @@ marshals arguments and streams progress, and reimplements nothing. To pull upstr
 
 ```bash
 CROSSPOINT_PIN=<new-sha> deno task vendor && deno task build
+CROSSPOINT_REPO=owner/repo CROSSPOINT_PIN=<sha> deno task vendor   # from a fork
 ```
 
 The device's plain HTTP calls (`/api/status`, `/api/files`, `/delete`, `/mkdir`, `/download`, WebDAV
@@ -135,12 +268,12 @@ The device's plain HTTP calls (`/api/status`, `/api/files`, `/delete`, `/mkdir`,
 ## Layout
 
 ```
-src/core/      config, SQLite schema + migrations, logging, event bus, ids
-src/library/   ingest pipeline, Calibre CLI wrappers, books, lists
+src/core/      config, SQLite schema + migrations, logging, event bus, ids, hashing
+src/library/   folder scanner, ingest pipeline, DRM detection, Calibre wrappers, import inbox
 src/engine/    Python sidecar supervisor; engine files embedded in the binary
 src/device/    device HTTP client, discovery + registry, identity
-src/sync/      resample profiles + cache, sync engine (add_new / mirror)
-src/web/       HTTP API and the no-build web UI
+src/sync/      resample profiles + cache, sync engine, reading state, kosync server
+src/web/       HTTP API, Preact UI sources (ui/), bundled output + shell (static/)
 src/desktop/   Deno.Tray + Deno.BrowserWindow shell (loaded only when present)
 engine/        sidecar.py, fetch_vendor.sh, vendored upstream modules
 tests/         unit tests, fake device, end-to-end acceptance script
@@ -159,17 +292,19 @@ deno task check        # type-check + lint + format check
 
 `tests/fake_device.ts` is a stand-in CrossInk reader implementing the confirmed protocol; it can
 simulate a failing upload (`--fail-upload N`) or a device that sleeps mid-transfer
-(`--drop-upload N`). `tests/acceptance.sh` walks the whole brief: ingest → list → optimize → sync →
-add_new → mirror → interruption → resume, verifying on-device EPUBs really are grayscale, ≤480×800,
-font-free and within the firmware's paragraph/file size limits.
+(`--drop-upload N`). `tests/acceptance.sh` walks the whole model: index a folder → content identity
+survives renames and deduplicates copies → optimize → sync → add → remove → unreadable-folder abort
+→ bulk-removal confirmation → interruption → resume. It verifies on-device EPUBs really are
+grayscale, ≤480×800, font-free, within the firmware's paragraph/file size limits, and stamped with
+their source hash. It binds its own port (8899) so it never talks to a running `deno task dev`.
 
 ## Data and configuration
 
 Everything lives in `~/Library/Application Support/pocket-sync/` (override with `POCKET_DATA_DIR`):
 
 ```
-db.sqlite                  library, lists, devices, rules, manifest
-library/<bookId>/          original.<ext>, book.epub, opt-<hash>.epub, cover.jpg
+db.sqlite                  index, devices, settings, manifest, reading state
+library/<md5>/             book.epub, opt-<hash>.epub, cover.jpg (derived only)
 logs/pocket-sync.log       rotating JSONL, mirrored to the UI and tray
 config.json                paths, discovery, upload, log level
 engine/                    materialized sidecar + .venv
