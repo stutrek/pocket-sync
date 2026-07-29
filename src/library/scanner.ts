@@ -6,7 +6,15 @@ import type { Logger } from "../core/log.ts";
 import type { Paths } from "../core/paths.ts";
 import type { Books } from "./books.ts";
 import type { Imports } from "./imports.ts";
-import { ACCEPTED_EXTS, basenameOf, extOf, ImportBlocked, type Ingest } from "./ingest.ts";
+import {
+  ACCEPTED_EXTS,
+  basenameOf,
+  editionKey,
+  extOf,
+  formatRank,
+  ImportBlocked,
+  type Ingest,
+} from "./ingest.ts";
 import { sourceById } from "./sources.ts";
 
 /** Partial downloads and editor droppings, never books. */
@@ -26,7 +34,7 @@ export interface ScanResult {
   cancelled?: boolean;
 }
 
-interface SeenFile {
+export interface SeenFile {
   path: string;
   size: number;
   mtime: number;
@@ -292,8 +300,6 @@ export class Scanner {
     try {
       // An external source knows which of its files are books; a plain watched
       // folder has no such rule and takes everything the extension check allows.
-      // An external source knows which of its files are books; a plain watched
-      // folder has no such rule and takes everything the extension check allows.
       files = await collect(lib.path, lib.sourceId ? sourceById(lib.sourceId)?.accepts : undefined);
     } catch (err) {
       return { ...result, unreadable: `walk failed: ${err}` };
@@ -304,7 +310,7 @@ export class Scanner {
     const now = Date.now();
     const seen = new Set<string>();
 
-    for (const file of files) {
+    for (const group of groupEditions(files)) {
       // The user can remove a folder mid-scan — importing a big one takes
       // minutes. Stop here rather than finishing, and above all rather than
       // re-inserting rows the removal has already deleted.
@@ -321,74 +327,36 @@ export class Scanner {
         return { ...result, cancelled: true };
       }
 
-      seen.add(file.path);
-
-      // Still being written (or copied in): leave it for the next pass.
-      if (settleMs > 0 && now - file.mtime < settleMs) {
-        result.deferred++;
+      // Still being written (or copied in): leave it for the next pass — the
+      // whole edition, not just the unsettled file. A `.mobi` whose `.epub` is
+      // still copying would otherwise import, then be superseded a minute
+      // later: a book sent to the reader and deleted again for nothing.
+      if (settleMs > 0 && group.some((f) => now - f.mtime < settleMs)) {
+        for (const f of group) seen.add(f.path);
+        result.deferred += group.length;
         continue;
       }
 
-      const known = this.db.get<{ size: number; mtime: number; md5: string }>(
-        "SELECT size, mtime, md5 FROM file_index WHERE path = ?",
-        file.path,
-      );
-      if (known && known.size === file.size && known.mtime === file.mtime) {
-        // Unchanged. Make sure the membership row still exists (it won't after
-        // a database reset) but skip the expensive work.
-        this.books.addToLibrary(libraryId, known.md5, file.path);
-        continue;
-      }
-
-      const job = this.imports.start(libraryId, file.path, basenameOf(file.path));
-      try {
-        this.imports.stage(job.id, "hashing");
-        const md5 = await md5File(file.path);
-        this.db.run(
-          `INSERT INTO file_index (path, library_id, size, mtime, md5, seen_at)
-           VALUES (?, ?, ?, ?, ?, ?)
-           ON CONFLICT (path) DO UPDATE SET
-             library_id = excluded.library_id, size = excluded.size,
-             mtime = excluded.mtime, md5 = excluded.md5, seen_at = excluded.seen_at`,
-          file.path,
-          libraryId,
-          file.size,
-          file.mtime,
-          md5,
-          new Date().toISOString(),
-        );
-
-        const book = await this.ingest.addFromPath(
-          libraryId,
-          file.path,
-          md5,
-          (stage) => this.imports.stage(job.id, stage),
-        );
-        this.imports.done(job.id, book.id);
-        result.added++;
-        this.bus.emit({
-          level: "info",
-          event: "ingest.done",
-          message: `Added “${book.title}”`,
-          bookId: book.id,
-          detail: { libraryId },
-        });
-      } catch (err) {
-        // Blocked imports wait in the Inbox for the user; failures are final
-        // until something changes on disk.
-        if (err instanceof ImportBlocked) {
-          this.imports.block(job.id, err.needs, err.message);
-        } else {
-          this.imports.fail(job.id, String(err instanceof Error ? err.message : err));
+      // One book in several formats. `group` is best-first, so the first file
+      // that lands wins and everything in a worse format is passed over —
+      // deliberately left out of `seen`, so a row an earlier pass made for it
+      // is reaped and the duplicate leaves the reader. Files of the *same*
+      // rank are separate editions rather than alternative formats, so they
+      // all still stand; and a format that cannot be imported (a DRM'd EPUB
+      // beside a plain MOBI) falls through to the next best rather than
+      // costing the book.
+      let takenRank: number | null = null;
+      for (const file of group) {
+        const rank = formatRank(extOf(file.path));
+        if (takenRank !== null && rank > takenRank) {
+          this.log.debug(
+            "scan.superseded",
+            `Skipping ${basenameOf(file.path)} — already have this book in a better format`,
+            { detail: { libraryId } },
+          );
+          break;
         }
-        // Forget the hash so resolving the block re-imports on the next scan.
-        this.db.run("DELETE FROM file_index WHERE path = ?", file.path);
-        this.bus.emit({
-          level: err instanceof ImportBlocked ? "warn" : "error",
-          event: "ingest.failed",
-          message: `${basenameOf(file.path)}: ${err instanceof Error ? err.message : err}`,
-          detail: { libraryId },
-        });
+        if (await this.#take(libraryId, file, seen, result)) takenRank = rank;
       }
     }
 
@@ -402,6 +370,86 @@ export class Scanner {
       );
     }
     return result;
+  }
+
+  /**
+   * Index one file, importing it if it is new or has changed.
+   *
+   * Returns whether the file now stands for a book in this folder — false for a
+   * blocked or failed import, which is what lets the caller fall back to
+   * another format of the same title instead of losing it.
+   */
+  async #take(
+    libraryId: string,
+    file: SeenFile,
+    seen: Set<string>,
+    result: ScanResult,
+  ): Promise<boolean> {
+    seen.add(file.path);
+
+    const known = this.db.get<{ size: number; mtime: number; md5: string }>(
+      "SELECT size, mtime, md5 FROM file_index WHERE path = ?",
+      file.path,
+    );
+    if (known && known.size === file.size && known.mtime === file.mtime) {
+      // Unchanged. Make sure the membership row still exists (it won't after
+      // a database reset) but skip the expensive work.
+      this.books.addToLibrary(libraryId, known.md5, file.path);
+      return true;
+    }
+
+    const job = this.imports.start(libraryId, file.path, basenameOf(file.path));
+    try {
+      this.imports.stage(job.id, "hashing");
+      const md5 = await md5File(file.path);
+      this.db.run(
+        `INSERT INTO file_index (path, library_id, size, mtime, md5, seen_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT (path) DO UPDATE SET
+           library_id = excluded.library_id, size = excluded.size,
+           mtime = excluded.mtime, md5 = excluded.md5, seen_at = excluded.seen_at`,
+        file.path,
+        libraryId,
+        file.size,
+        file.mtime,
+        md5,
+        new Date().toISOString(),
+      );
+
+      const book = await this.ingest.addFromPath(
+        libraryId,
+        file.path,
+        md5,
+        (stage) => this.imports.stage(job.id, stage),
+      );
+      this.imports.done(job.id, book.id);
+      result.added++;
+      this.bus.emit({
+        level: "info",
+        event: "ingest.done",
+        message: `Added “${book.title}”`,
+        bookId: book.id,
+        detail: { libraryId },
+      });
+      return true;
+    } catch (err) {
+      // Blocked imports wait in the Inbox for the user; failures are final
+      // until something changes on disk.
+      if (err instanceof ImportBlocked) {
+        this.imports.block(job.id, err.needs, err.message);
+      } else {
+        this.imports.fail(job.id, String(err instanceof Error ? err.message : err));
+      }
+      // Forget the hash so resolving the block re-imports on the next scan.
+      this.db.run("DELETE FROM file_index WHERE path = ?", file.path);
+      this.bus.emit({
+        level: err instanceof ImportBlocked ? "warn" : "error",
+        event: "ingest.failed",
+        message: `${basenameOf(file.path)}: ${err instanceof Error ? err.message : err}`,
+        detail: { libraryId },
+      });
+      return false;
+    }
   }
 
   /**
@@ -468,6 +516,40 @@ export class Scanner {
       }, 1500),
     );
   }
+}
+
+/**
+ * Gather the files that are one book in several formats.
+ *
+ * `Dune.epub` and `Dune.mobi` are the same book, and nothing downstream can
+ * tell: content hashing sees two different files, so both import, both convert,
+ * both go to the reader and the title appears twice on its shelf. Grouping by
+ * `editionKey()` and keeping only the best format is the only place this can be
+ * caught cheaply — before the MOBI is hashed and run through `ebook-convert`.
+ *
+ * Each group comes back sorted best-format-first, ties broken by path so a
+ * rescan makes the same choice every time — otherwise directory order decides,
+ * and the book on the reader churns between formats. Grouping is per-scan and
+ * therefore per-folder: two folders holding different formats of one book stay
+ * independent, which is what invariant 5 (a device's set is the union of its
+ * folders) needs — the union is deduplicated by MD5 later.
+ */
+export function groupEditions(files: SeenFile[]): SeenFile[][] {
+  const groups = new Map<string, SeenFile[]>();
+  for (const file of files) {
+    const key = editionKey(file.path);
+    const group = groups.get(key);
+    if (group) group.push(file);
+    else groups.set(key, [file]);
+  }
+  for (const group of groups.values()) {
+    if (group.length > 1) {
+      group.sort((a, b) =>
+        formatRank(extOf(a.path)) - formatRank(extOf(b.path)) || (a.path < b.path ? -1 : 1)
+      );
+    }
+  }
+  return [...groups.values()];
 }
 
 /**

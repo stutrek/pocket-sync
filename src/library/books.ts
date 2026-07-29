@@ -28,6 +28,15 @@ export type ReadingFilter = "all" | "reading" | "unread" | "finished";
 export interface BookQuery {
   query?: string;
   libraryId?: string;
+  /**
+   * Only books whose source file sits under this absolute path prefix — how the
+   * catalog browses into a subfolder.
+   *
+   * Compared with `instr(path, prefix) = 1` rather than `LIKE prefix || '%'`:
+   * `_` is a single-character wildcard in LIKE and is extremely common in
+   * filenames, so the pattern form would quietly match neighbouring folders.
+   */
+  pathPrefix?: string;
   /** Whose progress to show. Reading state is per person, so the shelf is
    * always somebody's shelf; without this there is no honest answer. */
   userId?: string;
@@ -41,6 +50,12 @@ export class Books {
 
   /**
    * Books visible in a folder, with one person's reading state attached.
+   *
+   * Grouped by book: the same file held by two watched folders is one book and
+   * must be listed once (invariant 7), and without the grouping an unfiltered
+   * query — the whole library, or an OPDS catalog browsing it — would show it
+   * twice. `library_id`/`path` are then one of the folders holding it, which is
+   * exactly the filtered folder whenever the query named one.
    */
   list(q: BookQuery = {}): LibraryRow[] {
     const where: string[] = [];
@@ -49,6 +64,10 @@ export class Books {
     if (q.libraryId) {
       where.push("lb.library_id = ?");
       params.push(q.libraryId);
+    }
+    if (q.pathPrefix) {
+      where.push("instr(lb.path, ?) = 1");
+      params.push(q.pathPrefix);
     }
     if (q.query?.trim()) {
       where.push("(b.title LIKE ? OR b.author LIKE ? OR b.series LIKE ?)");
@@ -76,6 +95,7 @@ export class Books {
       LEFT JOIN reading_state rs
              ON rs.book_id = lb.book_id AND rs.user_id = ?
       ${where.length ? "WHERE " + where.join(" AND ") : ""}
+      GROUP BY b.id
       ORDER BY b.title COLLATE NOCASE
       LIMIT ? OFFSET ?`;
     params.push(q.limit ?? 5000, q.offset ?? 0);
@@ -100,6 +120,46 @@ export class Books {
        ORDER BY b.title COLLATE NOCASE`,
       ...libraryIds,
     ).map((r) => r.book_id);
+  }
+
+  /**
+   * Where each book in these folders actually sits on disk — what the device
+   * layout mirrors (`devicePlacements()`).
+   *
+   * A book can be in several of a device's folders at once; the answer has to
+   * be the same on every sync or the file would move around the reader, so the
+   * rows are ordered and the first one wins rather than whichever the query
+   * happened to return.
+   */
+  sourcePathsForLibraries(libraryIds: string[]): Map<string, { libraryId: string; path: string }> {
+    const out = new Map<string, { libraryId: string; path: string }>();
+    if (!libraryIds.length) return out;
+    const holes = libraryIds.map(() => "?").join(",");
+    for (
+      const row of this.db.all<{ book_id: string; library_id: string; path: string }>(
+        `SELECT book_id, library_id, path FROM library_book
+         WHERE library_id IN (${holes})
+         ORDER BY library_id, path`,
+        ...libraryIds,
+      )
+    ) {
+      if (!out.has(row.book_id)) {
+        out.set(row.book_id, { libraryId: row.library_id, path: row.path });
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Every source path in one folder. The catalog builds its folder tree from
+   * these — the same evidence the device layout uses, so what a reader browses
+   * and what a sync would place agree.
+   */
+  pathsIn(libraryId: string): string[] {
+    return this.db.all<{ path: string }>(
+      "SELECT path FROM library_book WHERE library_id = ?",
+      libraryId,
+    ).map((r) => r.path);
   }
 
   librariesFor(bookId: string) {

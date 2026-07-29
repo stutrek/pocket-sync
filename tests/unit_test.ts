@@ -9,12 +9,14 @@ import {
 
 import {
   deviceFilename,
-  deviceFilenames,
+  devicePlacements,
   legacyBookIdFromFilename,
   newId,
   sanitizeForFilename,
   shortHash,
 } from "../src/core/ids.ts";
+import { relativeDirSegments } from "../src/sync/engine.ts";
+import { createHash } from "node:crypto";
 import { koreaderPartialMd5, md5Bytes, md5File } from "../src/core/hash.ts";
 import { detectDrm } from "../src/library/drm.ts";
 import { joinDevicePath, normalizeDevicePath } from "../src/device/client.ts";
@@ -32,23 +34,64 @@ Deno.test("ids: newId is sortable and unique", () => {
 
 Deno.test("ids: device filenames are human readable and firmware-safe", () => {
   const name = deviceFilename("Émile’s Guide to Ünicode: Part 2/3", "Ada Lovelace");
-  assertMatch(name, /^[A-Za-z0-9._-]+\.epub$/);
+  // Spaces are kept — this is a name read off a reader's screen. Everything the
+  // firmware or the upload handshake would choke on is not: no colon (the
+  // handshake is `START:<name>:<size>:<dir>`), no slash, nothing non-ASCII.
+  assertMatch(name, /^[A-Za-z0-9 ._-]+\.epub$/);
   assert(name.includes("Emile"), name);
-  assert(name.includes("Ada_Lovelace"), name);
+  assert(name.includes("Ada Lovelace"), name);
+  assertEquals(deviceFilename("Piranesi", "Susanna Clarke"), "Piranesi - Susanna Clarke.epub");
   assertEquals(deviceFilename("Piranesi"), "Piranesi.epub");
 });
 
-Deno.test("ids: colliding titles get a deterministic, content-derived suffix", () => {
+Deno.test("ids: books are placed in the folders they sit in on disk", () => {
+  const books = [
+    { id: "a".repeat(32), title: "Dune", author: "Frank Herbert", relDir: ["Sci-Fi"] },
+    { id: "b".repeat(32), title: "Emma", author: "Jane Austen", relDir: ["Classics", "Austen"] },
+    { id: "c".repeat(32), title: "Piranesi", author: "Susanna Clarke" },
+  ];
+  const places = devicePlacements(books);
+  assertEquals(places.get(books[0].id), {
+    dir: ["Sci-Fi"],
+    filename: "Dune - Frank Herbert.epub",
+  });
+  assertEquals(places.get(books[1].id)?.dir, ["Classics", "Austen"]);
+  assertEquals(places.get(books[2].id)?.dir, [], "a book at the top stays at the top");
+
+  // Folder names go through the same sanitizer, and one that survives it as
+  // nothing is dropped rather than becoming a level called "book".
+  assertEquals(
+    devicePlacements([{ ...books[0], relDir: ["Sci Fi: 1970s", "???"] }])
+      .get(books[0].id)?.dir,
+    ["Sci Fi 1970s"],
+  );
+});
+
+Deno.test("ids: names collide only within a folder, and break deterministically", () => {
   const books = [
     { id: "a".repeat(32), title: "Selected Poems", author: "Anon" },
     { id: "b".repeat(32), title: "Selected Poems", author: "Anon" },
     { id: "c".repeat(32), title: "Piranesi", author: "Susanna Clarke" },
   ];
-  const names = deviceFilenames(books);
-  assertEquals(new Set(names.values()).size, 3, "names must be unique");
+  const places = devicePlacements(books);
+  const paths = (m: Map<string, { dir: string[]; filename: string }>) =>
+    new Set([...m.values()].map((p) => [...p.dir, p.filename].join("/")));
+  assertEquals(paths(places).size, 3, "paths must be unique");
   // Same input, same output, regardless of the order books sync in.
-  assertEquals(names, deviceFilenames([...books].reverse()));
-  assertEquals(names.get(books[2].id), "Piranesi_-_Susanna_Clarke.epub");
+  assertEquals(places, devicePlacements([...books].reverse()));
+  assertEquals(places.get(books[2].id)?.filename, "Piranesi - Susanna Clarke.epub");
+  assert(places.get(books[0].id)?.filename.includes(books[0].id.slice(0, 6)));
+
+  // The same title and author in *different* folders is not a collision at all,
+  // so neither copy is disfigured with a hash.
+  const filed = devicePlacements([
+    { ...books[0], relDir: ["A"] },
+    { ...books[1], relDir: ["B"] },
+  ]);
+  assertEquals(paths(filed).size, 2);
+  for (const place of filed.values()) {
+    assertEquals(place.filename, "Selected Poems - Anon.epub");
+  }
 });
 
 Deno.test("ids: files from the old scheme stay attributable for cleanup", () => {
@@ -58,9 +101,33 @@ Deno.test("ids: files from the old scheme stay attributable for cleanup", () => 
 });
 
 Deno.test("ids: sanitize keeps something usable", () => {
-  assertEquals(sanitizeForFilename("  A  Tale   of Two  Cities "), "A_Tale_of_Two_Cities");
+  assertEquals(sanitizeForFilename("  A  Tale   of Two  Cities "), "A Tale of Two Cities");
   assertEquals(sanitizeForFilename("###"), "book");
   assert(sanitizeForFilename("x".repeat(200)).length <= 60);
+  // Truncation must not leave a trailing space or dot, which FAT-ish naming
+  // treats as a name of its own.
+  assertMatch(sanitizeForFilename("x".repeat(59) + " tail"), /[A-Za-z0-9]$/);
+});
+
+Deno.test("sync: the device mirrors the folders a book sits in on disk", () => {
+  assertEquals(relativeDirSegments("/books/shelf/Sci-Fi/Dune.epub", "/books/shelf"), ["Sci-Fi"]);
+  assertEquals(relativeDirSegments("/books/shelf/Dune.epub", "/books/shelf"), []);
+  // A trailing slash on the configured folder is not a difference.
+  assertEquals(relativeDirSegments("/books/shelf/A/B/x.epub", "/books/shelf/"), ["A", "B"]);
+
+  // Depth is capped: the firmware makes one folder per request, and a book
+  // below `listEpubs()`'s recursion limit would be invisible to us and re-sent
+  // on every sync.
+  assertEquals(
+    relativeDirSegments("/r/a/b/c/d/e/f/x.epub", "/r"),
+    ["a", "b", "c", "d"],
+  );
+
+  // Not under the folder it was indexed from: flat, rather than a path built
+  // from a mismatched prefix.
+  assertEquals(relativeDirSegments("/elsewhere/Dune.epub", "/books/shelf"), []);
+  assertEquals(relativeDirSegments("/books/shelf-other/Dune.epub", "/books/shelf"), []);
+  assertEquals(relativeDirSegments("/books/shelf/Dune.epub", ""), []);
 });
 
 Deno.test("profileHash changes with every setting that alters output", () => {
@@ -175,6 +242,23 @@ Deno.test("hash: KOReader partial MD5 is stable and content-derived", async () =
     // It samples rather than reading everything, so it differs from the plain
     // MD5 — both are recorded because CrossPoint's choice isn't documented.
     assertNotEquals(first, await md5File(path));
+
+    // The offsets are the reader's, not ours to choose: they are `1024 << 2i`
+    // in 32-bit for i in -1..10, so the first one wraps to 0. Pinned against a
+    // literal transcription rather than the constant, because computing them as
+    // `1024 * 4^i` samples from 256 and matches nothing the reader reports.
+    const expect = createHash("md5");
+    for (const off of [0, 1024, 4096, 16384, 65536]) {
+      expect.update(big.subarray(off, off + 1024));
+    }
+    assertEquals(first, expect.digest("hex"));
+
+    // The head of the file is sampled, so a change to byte 0 has to show up.
+    // Sampling from 256 leaves this file hashing identically.
+    const moved = big.slice();
+    moved[0] ^= 0xff;
+    await Deno.writeFile(`${dir}/moved.epub`, moved);
+    assertNotEquals(first, await koreaderPartialMd5(`${dir}/moved.epub`));
   } finally {
     await Deno.remove(dir, { recursive: true });
   }
@@ -460,7 +544,7 @@ Deno.test("sources: the allowlist is the only way to a path", async () => {
 // --- reading progress -------------------------------------------------------
 
 import { Db } from "../src/core/db.ts";
-import { FINISHED_AT, Reading } from "../src/sync/reading.ts";
+import { FINISHED_AT, Reading, storedReport } from "../src/sync/reading.ts";
 import type { EventBus } from "../src/core/events.ts";
 import type { Logger } from "../src/core/log.ts";
 
@@ -572,6 +656,63 @@ Deno.test("reading: progress is attributed to a person, never guessed", async (t
       assertEquals(state.finished, 0, "the reader must not undo a manual override");
       assertEquals(state.finished_source, "manual");
     });
+
+    await t.step("the whole report is kept, so the reader gets its own locator back", () => {
+      // A percentage with no locator is what makes a reader open a book at page
+      // one despite having synced it — only the reader can read its own
+      // position, so whatever it sent has to come back verbatim.
+      reading.record(
+        {
+          document: "doc-hash",
+          progress: "/body/DocFragment[3]/body/p[17]/text().0",
+          percentage: 0.4,
+          device: "White X3",
+          device_id: "x3-1",
+          position: { spine: 3, page: 88, pctQ: 400_000 },
+        },
+        "stu",
+        "device-1",
+      );
+      const stored = storedReport(reading.get("stu", BOOK)!.position_json);
+      assertEquals(stored.progress, "/body/DocFragment[3]/body/p[17]/text().0");
+      assertEquals(stored.device, "White X3");
+      assertEquals(stored.position?.page, 88);
+    });
+
+    await t.step("a side-loaded book is kept against its hash, not dropped", () => {
+      // On the reader, never sent by us, so there is no book to attach it to —
+      // and the reader cannot tell that from page sync being broken.
+      const payload = { document: "sideloaded", progress: "/body/p[9]", percentage: 0.31 };
+      assertEquals(reading.record(payload, "stu", null).bookId, null);
+      reading.recordUnmapped(payload, "stu", null);
+      assertEquals(reading.unmapped("stu", "sideloaded")!.percentage, 0.31);
+      // Same rule as everything else here: it belongs to the person who
+      // authenticated, not to whoever else holds the same file.
+      assertEquals(reading.unmapped("sarah", "sideloaded"), undefined);
+      // And it stays out of the library — there is no book to show it on.
+      assertEquals(
+        db.get<{ n: number }>("SELECT COUNT(*) AS n FROM reading_state WHERE user_id = 'stu'")!.n,
+        1,
+      );
+      reading.forgetUser("stu");
+      assertEquals(reading.unmapped("stu", "sideloaded"), undefined);
+      // Put the position back for the steps that follow.
+      reading.record({ document: "doc-hash", percentage: 1 }, "stu", "device-1");
+      reading.setFinished("stu", BOOK, false);
+    });
+
+    await t.step("a position stored before the round-trip still reads back", () => {
+      // Old rows hold the bare `position` object; they must not be mistaken for
+      // a full report with everything missing.
+      db.run(
+        "UPDATE reading_state SET position_json = ? WHERE user_id = 'stu' AND book_id = ?",
+        JSON.stringify({ xpath: "/body/p[2]" }),
+        BOOK,
+      );
+      const stored = storedReport(reading.get("stu", BOOK)!.position_json);
+      assertEquals(stored.progress, undefined);
+      assertEquals(stored.position?.xpath, "/body/p[2]");
+    });
   } finally {
     db.close();
     await Deno.remove(dir, { recursive: true });
@@ -584,7 +725,7 @@ import { ConfigStore } from "../src/core/config.ts";
 import { Paths } from "../src/core/paths.ts";
 import { Books } from "../src/library/books.ts";
 import { Scanner } from "../src/library/scanner.ts";
-import type { Imports } from "../src/library/imports.ts";
+import { Imports } from "../src/library/imports.ts";
 import type { Ingest } from "../src/library/ingest.ts";
 
 Deno.test("reconcile drops what belongs to folders that are no longer watched", async () => {
@@ -724,6 +865,177 @@ Deno.test("reconcile keeps books that are still on a device", async () => {
       1,
       "a book still on a reader keeps its manifest entry and artifacts",
     );
+    db.close();
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+// --- one book, several formats ----------------------------------------------
+
+import { groupEditions } from "../src/library/scanner.ts";
+import { basenameOf, editionKey, extOf, formatRank, ImportBlocked } from "../src/library/ingest.ts";
+import type { Book } from "../src/library/books.ts";
+
+function seenFiles(...paths: string[]) {
+  return paths.map((path) => ({ path, size: path.length, mtime: 0 }));
+}
+
+Deno.test("editions: the same title in two formats is one book", () => {
+  // Calibre keeps every format of a book side by side in its folder.
+  const [group, ...rest] = groupEditions(seenFiles(
+    "/lib/Frank Herbert/Dune (3)/Dune - Frank Herbert.mobi",
+    "/lib/Frank Herbert/Dune (3)/Dune - Frank Herbert.epub",
+  ));
+  assertEquals(rest.length, 0, "one book, not two");
+  assertEquals(group.map((f) => extOf(f.path)), ["epub", "mobi"], "best format first");
+
+  // A library split into per-format trees is the same book too — which is why
+  // the key ignores the directory.
+  assertEquals(groupEditions(seenFiles("/lib/epub/Dune.epub", "/lib/mobi/Dune.mobi")).length, 1);
+
+  // Case and separators differ between the copies more often than not.
+  assertEquals(editionKey("/a/The_Hobbit.epub"), editionKey("/b/the hobbit.MOBI"));
+
+  // Two *editions* of one title are a real thing and are told apart by format,
+  // not by name: same rank, so neither supersedes the other.
+  const editions = groupEditions(seenFiles("/lib/A (1)/Dune.epub", "/lib/A (7)/Dune.epub"));
+  assertEquals(editions.length, 1);
+  assertEquals(editions[0].map((f) => formatRank(extOf(f.path))), [0, 0]);
+
+  // Ties break on path so a rescan makes the same choice every time — otherwise
+  // the book on the reader churns between two files.
+  assertEquals(editions[0][0].path, "/lib/A (1)/Dune.epub");
+
+  // A different book keeps to itself.
+  assertEquals(groupEditions(seenFiles("/lib/Dune.epub", "/lib/Emma.epub")).length, 2);
+
+  // EPUB needs no conversion at all; PDF converts worst; a fulfilment token is
+  // not a book and only stands when nothing else carries the title.
+  assert(formatRank("epub") < formatRank("mobi"));
+  assert(formatRank("mobi") < formatRank("pdf"));
+  assert(formatRank("pdf") < formatRank("acsm"));
+});
+
+/** Enough of `Ingest` for the scanner: records what it was asked to import. */
+function fakeIngest(db: Db, books: Books, blocked: (path: string) => boolean = () => false) {
+  const imported: string[] = [];
+  const ingest = {
+    imported,
+    // deno-lint-ignore require-await
+    async addFromPath(libraryId: string, sourcePath: string, md5: string): Promise<Book> {
+      if (blocked(sourcePath)) throw new ImportBlocked("drm-key", "no key for this one");
+      imported.push(basenameOf(sourcePath));
+      db.run(
+        `INSERT OR IGNORE INTO book (id, title, author, added_at, original_ext, epub_path)
+         VALUES (?, ?, '', ?, ?, ?)`,
+        md5,
+        basenameOf(sourcePath),
+        new Date().toISOString(),
+        extOf(sourcePath),
+        `${sourcePath}.epub`,
+      );
+      books.addToLibrary(libraryId, md5, sourcePath);
+      return books.get(md5)!;
+    },
+  };
+  return ingest;
+}
+
+async function scanFixture(dir: string, blocked?: (path: string) => boolean) {
+  const paths = new Paths(dir);
+  paths.ensure();
+  const config = ConfigStore.load(paths);
+  await Deno.mkdir(`${dir}/books`, { recursive: true });
+  config.update({
+    // No settle window: the fixture's files were written a moment ago.
+    scan: { ...config.current.scan, settleSec: 0 },
+    libraries: [{ id: "lib", name: "Books", path: `${dir}/books`, deviceIds: [] }],
+  });
+  const db = new Db(paths.db);
+  const books = new Books(db, paths);
+  const ingest = fakeIngest(db, books, blocked);
+  const noop = () => {};
+  const scanner = new Scanner(
+    db,
+    config,
+    books,
+    paths,
+    ingest as unknown as Ingest,
+    new Imports(db),
+    { debug: noop, info: noop, warn: noop, error: noop } as unknown as Logger,
+    { emit: noop } as unknown as EventBus,
+  );
+  return { db, books, ingest, scanner, folder: `${dir}/books` };
+}
+
+Deno.test("scan: only the best format of a book is imported", async () => {
+  const dir = await Deno.makeTempDir();
+  try {
+    const { db, books, ingest, scanner, folder } = await scanFixture(dir);
+
+    // The MOBI arrives first and is a book like any other.
+    await Deno.writeTextFile(`${folder}/Dune - Frank Herbert.mobi`, "mobi bytes");
+    await scanner.scan("lib");
+    assertEquals(ingest.imported, ["Dune - Frank Herbert.mobi"]);
+    assertEquals(books.list().length, 1);
+
+    // Then the EPUB of the same book turns up. It supersedes the MOBI, which is
+    // never converted and does not stay in the library as a second copy.
+    await Deno.writeTextFile(`${folder}/Dune - Frank Herbert.epub`, "epub bytes");
+    const result = await scanner.scan("lib");
+    assertEquals(ingest.imported, [
+      "Dune - Frank Herbert.mobi",
+      "Dune - Frank Herbert.epub",
+    ]);
+    assertEquals(result.found, 2, "both files are on disk");
+    assertEquals(books.list().length, 1, "but only one book");
+    assertEquals(books.list()[0].original_ext, "epub");
+    assertEquals(
+      db.get<{ n: number }>("SELECT COUNT(*) AS n FROM file_index")!.n,
+      1,
+      "the superseded file's index row is reaped",
+    );
+
+    // A rescan is stable: nothing is imported again, nothing flaps back.
+    await scanner.scan("lib");
+    assertEquals(ingest.imported.length, 2);
+    assertEquals(books.list().length, 1);
+    assertEquals(books.list()[0].original_ext, "epub");
+
+    // Delete the EPUB and the MOBI is a book again rather than a hole.
+    await Deno.remove(`${folder}/Dune - Frank Herbert.epub`);
+    await scanner.scan("lib");
+    assertEquals(books.list().length, 1);
+    assertEquals(books.list()[0].original_ext, "mobi");
+
+    db.close();
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test("scan: a format that cannot be imported falls through to the next", async () => {
+  const dir = await Deno.makeTempDir();
+  try {
+    // The EPUB is the better format but is DRM-protected and waits in the
+    // Inbox. Superseding on that basis would cost the book entirely.
+    const { db, books, ingest, scanner, folder } = await scanFixture(
+      dir,
+      (path) => path.endsWith(".epub"),
+    );
+    await Deno.writeTextFile(`${folder}/Dune.epub`, "locked");
+    await Deno.writeTextFile(`${folder}/Dune.mobi`, "readable");
+
+    await scanner.scan("lib");
+    assertEquals(ingest.imported, ["Dune.mobi"]);
+    assertEquals(books.list().length, 1);
+    assertEquals(
+      db.get<{ state: string }>("SELECT state FROM import_job WHERE path LIKE '%.epub'")!.state,
+      "blocked",
+      "the EPUB is still in the Inbox, so unlocking it is worth doing",
+    );
+
     db.close();
   } finally {
     await Deno.remove(dir, { recursive: true });
@@ -1051,7 +1363,7 @@ Deno.test("kosync: sync servers are per person, ours first", async (t) => {
 });
 
 import { flattenSettings } from "../src/device/client.ts";
-import { asciiFilename, esc } from "../src/web/opds.ts";
+import { asciiFilename, esc, safeSegments } from "../src/web/opds.ts";
 
 Deno.test("device: /api/settings is read as descriptors, not a flat object", () => {
   // Firmware 1.4.0-tiny answers the read with an array of descriptors while the
@@ -1100,6 +1412,16 @@ Deno.test("device: /api/settings is read as descriptors, not a flat object", () 
   assertEquals(flattenSettings([{ nope: 1 }, { key: "deviceName", value: "" }]), {
     deviceName: "",
   });
+});
+
+Deno.test("opds: a browsed folder path is reduced to plain names", () => {
+  assertEquals(safeSegments("Sci-Fi/Classics"), ["Sci-Fi", "Classics"]);
+  assertEquals(safeSegments(""), []);
+  // Nothing here opens a file, but a path that cannot exist should land on the
+  // parent rather than on something surprising.
+  assertEquals(safeSegments("../../etc"), ["etc"]);
+  assertEquals(safeSegments("/a//b/./c/"), ["a", "b", "c"]);
+  assertEquals(safeSegments("a\\b"), ["a", "b"]);
 });
 
 Deno.test("opds: feed text is XML-escaped, and download names are header-safe", () => {

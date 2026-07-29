@@ -82,7 +82,11 @@ sync_now() {
   wait_idle
   echo "$out"
 }
-device_epubs() { ls "$DEV" 2>/dev/null | grep -c '\.epub$'; }
+# Books are nested in folders mirroring the watched folder, so counting them
+# means walking the tree — a flat `ls` would report zero and read as "the
+# reader was wiped".
+device_epubs() { find "$DEV" -name '*.epub' 2>/dev/null | wc -l | tr -d ' '; }
+device_find()  { find "$DEV" -name "$1" 2>/dev/null | head -1; }
 starts() { grep -c 'START ' "$WORK/device.log"; }
 book_count() { curl -sS "$API/api/library" | jqp "print(len(json.load(sys.stdin)))"; }
 
@@ -109,8 +113,13 @@ from PIL import Image, ImageDraw
 out = sys.argv[1]
 para = ("A paragraph long enough to force the CrossPoint text splitter to do real work, "
         "repeated so the file comfortably exceeds the nine-and-a-half kilobyte split limit. ") * 12
+# Two of them live in subfolders: the device mirrors whatever arrangement the
+# user made, so a flat fixture would never exercise the layout at all.
+subdirs = {"Charlie": "Sci-Fi", "Echo": os.path.join("Sci-Fi", "Classics")}
 for name in ["Alpha", "Bravo", "Charlie", "Delta", "Echo", "Foxtrot"]:
-    open(os.path.join(out, f"Test Author - {name}.txt"), "w").write(f"{name}\n\n{para}\n\n{para}")
+    folder = os.path.join(out, subdirs.get(name, ""))
+    os.makedirs(folder, exist_ok=True)
+    open(os.path.join(folder, f"Test Author - {name}.txt"), "w").write(f"{name}\n\n{para}\n\n{para}")
 img = Image.new("RGB", (1400, 2000), (255, 255, 255))
 d = ImageDraw.Draw(img)
 d.rectangle([100, 200, 1300, 1800], fill=(200, 60, 60))
@@ -160,7 +169,7 @@ PROFNAME=$(curl -sS "$API/api/profiles" | jqp \
 [ "$PROFNAME" = "X4 default" ] && ok "resampling defaulted to the device model ($PROFNAME)" \
                                || bad "expected the X4 profile by default, got '$PROFNAME'"
 wait_idle
-rm -f "$DEV"/*.epub
+find "$DEV" -name '*.epub' -delete 2>/dev/null
 curl -sS "$API/api/library" | jqp \
   "print('\n'.join(b['id'] for b in json.load(sys.stdin)))" > "$WORK/ids"
 while read -r id; do
@@ -172,11 +181,61 @@ RESULT=$(sync_now)
 SENT=$(echo "$RESULT" | jqp "print(json.load(sys.stdin)['sent'])")
 [ "$(device_epubs)" = "7" ] && ok "all 7 books on device (sent=$SENT)" \
                             || bad "expected 7 epubs on device, found $(device_epubs)"
-if ls "$DEV" | grep -qE '^[0-9a-f]{32}\.epub$'; then
+if find "$DEV" -name '*.epub' | grep -qE '/[0-9a-f]{32}\.epub$'; then
   bad "device filenames are still hashes, not titles"
 else
-  ok "device filenames are readable ($(ls "$DEV" | head -1))"
+  ok "device filenames are readable ($(basename "$(device_find '*.epub')"))"
 fi
+
+step "4b. The reader mirrors the folders, with names a person can read"
+# `Test Author - Charlie.txt` lives in `Sci-Fi/` on disk, so it lives in
+# `Sci-Fi/` on the reader — under the title and author, separated by spaces.
+# The watched folder's own name is the top level: without it, several bound
+# folders would merge into the upload path and a flat collection would be
+# indistinguishable from every other one.
+[ -n "$(find "$DEV/Shelf/Sci-Fi" -maxdepth 1 -name '*Charlie*.epub' 2>/dev/null)" ] \
+  && ok "a book in Sci-Fi/ landed in Shelf/Sci-Fi/ on the reader" \
+  || bad "expected a Charlie book in $DEV/Shelf/Sci-Fi, tree is:
+$(cd "$DEV" && find . -name '*.epub' | sort)"
+[ -n "$(find "$DEV/Shelf/Sci-Fi/Classics" -name '*Echo*.epub' 2>/dev/null)" ] \
+  && ok "a nested folder is reproduced in full (Shelf/Sci-Fi/Classics)" \
+  || bad "expected an Echo book in $DEV/Shelf/Sci-Fi/Classics"
+[ -n "$(find "$DEV/Shelf" -maxdepth 1 -name '*Alpha*.epub')" ] \
+  && ok "a book at the top of the folder sits at the top of its folder" \
+  || bad "expected an Alpha book directly in $DEV/Shelf"
+if find "$DEV" -name '*_*.epub' | grep -q .; then
+  bad "underscores remain in device filenames: $(find "$DEV" -name '*_*.epub' | head -3)"
+else
+  ok "no underscores anywhere — the shelf reads as titles, not identifiers"
+fi
+
+step "4c. Reorganizing the folder on disk moves the book on the reader"
+# The firmware has no rename, so a move is a re-send plus a delete. The old copy
+# must not survive, and the folder it emptied must not be left behind.
+mkdir -p "$SHELF/Poetry"
+mv "$SHELF/Test Author - Foxtrot.txt" "$SHELF/Poetry/Test Author - Foxtrot.txt"
+rescan
+PLAN=$(curl -sS "$API/api/devices" | jqp \
+  "d=next(x['plan'] for x in json.load(sys.stdin) if x['id']=='$DEVICE_ID')
+print(d['send'], d['remove'])")
+[ "$PLAN" = "1 0" ] \
+  && ok "the preview counts the move as a send, not a removal ($PLAN)" \
+  || bad "expected '1 0' from the plan, got '$PLAN'"
+sync_now >/dev/null
+[ -n "$(find "$DEV/Shelf/Poetry" -name '*Foxtrot*.epub' 2>/dev/null)" ] \
+  && [ -z "$(find "$DEV/Shelf" -maxdepth 1 -name '*Foxtrot*.epub')" ] \
+  && ok "the book moved into Poetry/ and the old copy is gone" \
+  || bad "move failed, tree is:
+$(cd "$DEV" && find . -name '*.epub' | sort)"
+[ "$(device_epubs)" = "7" ] && ok "still 7 books, not 8 — a move is not a copy" \
+                            || bad "expected 7 books after the move, found $(device_epubs)"
+# And moving it back empties Poetry/, which should not be left on the shelf.
+mv "$SHELF/Poetry/Test Author - Foxtrot.txt" "$SHELF/Test Author - Foxtrot.txt"
+rmdir "$SHELF/Poetry"
+rescan
+sync_now >/dev/null
+[ ! -d "$DEV/Shelf/Poetry" ] && ok "the folder it emptied was cleaned up" \
+                             || bad "an empty Poetry/ folder was left on the reader"
 
 step "5. Delivered EPUBs are genuinely device-safe"
 CLEAN=$("$VENV/bin/python3" - "$DEV" <<'PY'
@@ -184,7 +243,7 @@ import glob, io, os, re, sys, zipfile
 from PIL import Image
 bad = []
 stamped = 0
-for path in glob.glob(os.path.join(sys.argv[1], "*.epub")):
+for path in glob.glob(os.path.join(sys.argv[1], "**", "*.epub"), recursive=True):
     z = zipfile.ZipFile(path)
     names = z.namelist()
     if names[0] != "mimetype":
@@ -230,6 +289,32 @@ PY
                        || bad "device-safety check failed:
 $CLEAN"
 
+step "5b. One book in two formats is one book"
+# The same title as an EPUB *and* a TXT. Content hashing cannot see that these
+# are one book — different bytes — so without format dedupe the reader shows
+# Delta twice. A real EPUB is needed for the check to mean anything, and the
+# device already holds one; where it came from is irrelevant to the scanner.
+DELTA_EPUB=$(device_find '*Delta*.epub')
+cp "$DELTA_EPUB" "$SHELF/Test Author - Delta.epub"
+rescan
+DELTA_EXT=$(curl -sS "$API/api/library" | jqp \
+  "print(next((b['original_ext'] for b in json.load(sys.stdin) if 'Delta' in b['title']), 'none'))")
+[ "$(book_count)" = "7" ] && [ "$DELTA_EXT" = "epub" ] \
+  && ok "the EPUB supersedes the TXT of the same book (still $(book_count) books)" \
+  || bad "expected 7 books with Delta as epub, got $(book_count) books, ext=$DELTA_EXT"
+sync_now >/dev/null
+[ "$(device_epubs)" = "7" ] && ok "the reader carries it once, not twice" \
+                            || bad "expected 7 files on the device, found $(device_epubs)"
+# Take the better format away and the book is still a book, not a hole.
+rm -f "$SHELF/Test Author - Delta.epub"
+rescan
+DELTA_EXT=$(curl -sS "$API/api/library" | jqp \
+  "print(next((b['original_ext'] for b in json.load(sys.stdin) if 'Delta' in b['title']), 'none'))")
+[ "$(book_count)" = "7" ] && [ "$DELTA_EXT" = "txt" ] \
+  && ok "removing the EPUB restores the TXT rather than losing the book" \
+  || bad "expected Delta back as txt, got $(book_count) books, ext=$DELTA_EXT"
+sync_now >/dev/null
+
 step "6. A new file in the folder syncs; nothing else moves"
 BEFORE=$(starts)
 printf 'Hotel\n\nA genuinely different book, so its content hash is new.\n%s\n' \
@@ -262,7 +347,9 @@ rescan
 
 step "9. Bulk removals stop and ask before deleting"
 mkdir -p "$WORK/stash"
-mv "$SHELF"/*.txt "$WORK/stash/"
+# Everything, subfolders included — the point is a folder that has gone empty,
+# and leaving the nested books behind would keep this under the threshold.
+mv "$SHELF"/* "$WORK/stash/"
 rescan
 RESULT=$(curl -sS -X POST "$API/api/devices/$DEVICE_ID/sync")
 wait_idle
@@ -274,7 +361,7 @@ RESULT=$(sync_now)
 DELETED=$(echo "$RESULT" | jqp "print(json.load(sys.stdin)['deleted'])")
 [ "$DELETED" -gt 0 ] && ok "confirming removed $DELETED book(s) (device now has $(device_epubs))" \
                      || bad "confirmed sync deleted nothing"
-mv "$WORK/stash"/*.txt "$SHELF/"
+mv "$WORK/stash"/* "$SHELF/"
 rescan
 
 step "10. Paths outside the root are refused over HTTP"
@@ -372,7 +459,7 @@ GONE=$(curl -sS "$API/api/libraries" | jqp \
 step "14. Connection dropped mid-transfer: no corrupt files, resumes later"
 sync_now >/dev/null   # drop the second folder's books now that it is unbound
 stop_device
-rm -f "$DEV"/*.epub
+find "$DEV" -name '*.epub' -delete 2>/dev/null
 start_device "--drop-upload 1"
 curl -sS "$API/api/library" | jqp "print('\n'.join(b['id'] for b in json.load(sys.stdin)))" \
   > "$WORK/ids"
@@ -382,7 +469,7 @@ sync_now >/dev/null
 CORRUPT=$("$VENV/bin/python3" - "$DEV" <<'PY'
 import glob, os, sys, zipfile
 broken = []
-for p in glob.glob(os.path.join(sys.argv[1], "*.epub")):
+for p in glob.glob(os.path.join(sys.argv[1], "**", "*.epub"), recursive=True):
     try:
         z = zipfile.ZipFile(p)
         if z.testzip() is not None:
@@ -543,6 +630,86 @@ sync_now >/dev/null
   && ok "an already-configured reader is not written to again" \
   || bad "page-sync settings were pushed a second time"
 
+step "18b. A position reported by a reader comes back to it"
+# The whole loop, exactly as the firmware walks it: hash the file it holds,
+# report a place in it, ask for that place back. Every piece has to agree, and
+# when one does not the reader is told so in the only way the protocol has — an
+# empty body, which it renders as page one updated by nobody. A wrong hash and a
+# dropped locator look identical from the device, and both still answer 200.
+KOSYNC="http://127.0.0.1:8898"
+read -r KOUSER KOPASS <<<"$(curl -sS "$API/api/kosync" | python3 -c "
+import json, sys
+me = next(u for u in json.load(sys.stdin)['users'] if u['userId'] == '$USER_ID')
+print(me['username'], me['password'])
+")"
+KOKEY=$(python3 -c "import hashlib; print(hashlib.md5('$KOPASS'.encode()).hexdigest())")
+SENT=$(device_find '*.epub')
+# KOReader's util.partialMD5, transcribed from the Lua rather than imported from
+# src/core/hash.ts — checking our implementation against itself would pass no
+# matter which offsets it sampled. Note `1024 << 2i` in 32 bits: i = -1 wraps to
+# offset 0, and getting that one wrong matches no book at all.
+DOC=$(python3 -c "
+import hashlib
+h = hashlib.md5()
+with open('$SENT', 'rb') as f:
+    for i in range(-1, 11):
+        f.seek((1024 << ((2 * i) % 32)) & 0xFFFFFFFF)
+        sample = f.read(1024)
+        if not sample:
+            break
+        h.update(sample)
+print(h.hexdigest())
+")
+LOC='/body/DocFragment[3]/body/p[17]/text().0'
+curl -sS -X PUT -H 'content-type: application/json' \
+  -H "x-auth-user: $KOUSER" -H "x-auth-key: $KOKEY" \
+  -d "{\"document\":\"$DOC\",\"progress\":\"$LOC\",\"percentage\":0.42,\"device\":\"Acceptance X3\"}" \
+  "$KOSYNC/syncs/progress" >/dev/null
+BACK=$(curl -sS -H "x-auth-user: $KOUSER" -H "x-auth-key: $KOKEY" \
+  "$KOSYNC/syncs/progress/$DOC" | python3 -c "
+import json, sys
+got = json.load(sys.stdin)
+print(got.get('percentage'), got.get('progress'), got.get('device'), sep='|')
+")
+[ "$BACK" = "0.42|$LOC|Acceptance X3" ] \
+  && ok "the reader's own position and locator come back unchanged" \
+  || bad "the round trip lost something — got '$BACK' for $(basename "$SENT")"
+
+# And it resolved to a book, not just to a stored hash: the delivered bytes
+# differ per profile, so this is the mapping doing its job.
+SHELVED=$(curl -sS "$API/api/library?user=$USER_ID" | python3 -c "
+import json, sys
+print(sum(1 for b in json.load(sys.stdin) if round(b.get('percentage') or 0, 2) == 0.42))
+")
+[ "$SHELVED" = "1" ] && ok "the library shows that book as 42% read" \
+                     || bad "expected one book at 42%, found $SHELVED"
+
+# A side-loaded book — on the reader, never sent by us, so its hash maps to no
+# book of ours and never can. It still has to sync: the reader cannot tell
+# "unknown book" from "page sync is broken", because both answer it the same way.
+SIDE=$(python3 -c "
+import hashlib
+print(hashlib.md5(b'a book nobody here has ever seen').hexdigest())
+")
+curl -sS -X PUT -H 'content-type: application/json' \
+  -H "x-auth-user: $KOUSER" -H "x-auth-key: $KOKEY" \
+  -d "{\"document\":\"$SIDE\",\"progress\":\"/body/p[9]\",\"percentage\":0.31,\"device\":\"Acceptance X3\"}" \
+  "$KOSYNC/syncs/progress" >/dev/null
+SIDEBACK=$(curl -sS -H "x-auth-user: $KOUSER" -H "x-auth-key: $KOKEY" \
+  "$KOSYNC/syncs/progress/$SIDE" | python3 -c "
+import json, sys
+got = json.load(sys.stdin)
+print(got.get('percentage'), got.get('progress'), sep='|')
+")
+[ "$SIDEBACK" = "0.31|/body/p[9]" ] \
+  && ok "a side-loaded book syncs too, against its hash alone" \
+  || bad "a side-loaded book's position was lost: '$SIDEBACK'"
+
+# ...without inventing a book for it. The shelf is what we delivered.
+UNCHANGED=$(book_count)
+[ "$UNCHANGED" = "7" ] && ok "no phantom book appeared in the library" \
+                       || bad "the library grew to $UNCHANGED books"
+
 step "19. A reader already pointed elsewhere is adopted, not overwritten"
 # Somebody set this reader up by hand against their own sync server before
 # Pocket Sync ever saw it. Handing it to a new person is what clears the
@@ -652,10 +819,117 @@ SAME=$(python3 -c "
 import hashlib, pathlib, sys
 def md5(p): return hashlib.md5(p.read_bytes()).hexdigest()
 want = md5(pathlib.Path('$WORK/pulled.epub'))
-print(any(md5(p) == want for p in pathlib.Path('$DEV').glob('*.epub')))
+print(any(md5(p) == want for p in pathlib.Path('$DEV').rglob('*.epub')))
 ")
 [ "$SAME" = "True" ] && ok "a catalog download is byte-identical to the synced copy" \
                      || bad "the catalog served different bytes from the ones on the device"
+
+# Browsing mirrors the folders on disk — the same structure a sync places on
+# the reader, so the catalog is not the one place the arrangement stops being
+# true.
+BROWSE=$("$VENV/bin/python3" - "$OPDS/opds/d/$DEVICE_ID" <<'PY'
+import sys, urllib.request, xml.etree.ElementTree as ET
+ns = {"a": "http://www.w3.org/2005/Atom"}
+NAV = "application/atom+xml;profile=opds-catalog;kind=navigation"
+ACQ = "application/atom+xml;profile=opds-catalog;kind=acquisition"
+base = sys.argv[1]
+
+def get(url):
+    with urllib.request.urlopen(url) as r:
+        return ET.fromstring(r.read())
+
+def entries(feed):
+    out = {}
+    for e in feed.findall("a:entry", ns):
+        link = e.find("a:link", ns)
+        out[e.find("a:title", ns).text] = (link.get("href"), link.get("type"))
+    return out
+
+problems = []
+folders = entries(get(base + "/folders"))
+if "Shelf" not in folders:
+    problems.append(f"no Shelf in the folders feed: {list(folders)}")
+else:
+    href, kind = folders["Shelf"]
+    # It has subfolders, so it must be advertised as navigation: a reader that
+    # trusts the type will not open an entry whose type is a lie.
+    if kind != NAV:
+        problems.append(f"Shelf is typed {kind}, expected navigation")
+    shelf = entries(get(href))
+    if "Sci-Fi" not in shelf:
+        problems.append(f"Sci-Fi missing from the Shelf feed: {list(shelf)}")
+    else:
+        sub_href, sub_kind = shelf["Sci-Fi"]
+        if sub_kind != NAV:
+            problems.append(f"Sci-Fi is typed {sub_kind}, expected navigation")
+        scifi = entries(get(sub_href))
+        if "Classics" not in scifi:
+            problems.append(f"nested Classics missing: {list(scifi)}")
+        allof = [t for t in scifi if t.startswith("All books")]
+        if not allof:
+            problems.append(f"no aggregate entry under Sci-Fi: {list(scifi)}")
+        else:
+            href2, kind2 = scifi[allof[0]]
+            if kind2 != ACQ:
+                problems.append(f"“{allof[0]}” is typed {kind2}, expected acquisition")
+            books = get(href2).findall("a:entry", ns)
+            # Charlie sits in Sci-Fi/ and Echo in Sci-Fi/Classics/: the
+            # aggregate is recursive, and it is *not* the whole library.
+            if len(books) != 2:
+                problems.append(
+                    f"expected 2 books below Sci-Fi, got "
+                    f"{[b.find('a:title', ns).text for b in books]}")
+print("; ".join(problems) if problems else "OK")
+PY
+)
+[ "$BROWSE" = "OK" ] && ok "the catalog browses the same folder tree the reader is given" \
+                     || bad "catalog browsing does not mirror the folders: $BROWSE"
+
+# A folder this reader does not sync is still in its catalog: pushing is what a
+# device is given, pulling is what it can go and get, and a folder deliberately
+# kept off the sync list is exactly the one somebody wants to browse.
+LOOSE="$BOOKROOT/loose"
+mkdir -p "$LOOSE"
+# Built from a book that already ingests cleanly, with a line of its own so the
+# content hash — and so the identity — is a different book, not the same one in
+# two folders.
+{ cat "$SHELF/Test Author - Bravo.txt"; echo "Hotel, and nowhere else."; } \
+  > "$LOOSE/Test Author - Hotel.txt"
+LOOSELIB=$(curl -sS -X POST -H 'content-type: application/json' \
+  -d '{"name":"Unsynced","relPath":"loose"}' "$API/api/libraries" \
+  | jqp "print(json.load(sys.stdin)['id'])")
+curl -sS -X POST "$API/api/libraries/$LOOSELIB/scan" >/dev/null
+wait_idle
+UNSYNCED=$("$VENV/bin/python3" - "$OPDS/opds/d/$DEVICE_ID" <<'PY'
+import sys, urllib.request, xml.etree.ElementTree as ET
+ns = {"a": "http://www.w3.org/2005/Atom"}
+base = sys.argv[1]
+
+def get(url):
+    with urllib.request.urlopen(url) as r:
+        return ET.fromstring(r.read())
+
+folders = {e.find("a:title", ns).text: e.find("a:link", ns).get("href")
+           for e in get(base + "/folders").findall("a:entry", ns)}
+if "Unsynced" not in folders:
+    print(f"the unsynced folder is not in the feed: {list(folders)}")
+else:
+    titles = [e.find("a:title", ns).text
+              for e in get(folders["Unsynced"]).findall("a:entry", ns)]
+    # And its books are really fetchable, not just listed.
+    href = next(l.get("href") for e in get(folders["Unsynced"]).findall("a:entry", ns)
+                for l in e.findall("a:link", ns)
+                if l.get("rel") == "http://opds-spec.org/acquisition")
+    with urllib.request.urlopen(href) as r:
+        got = len(r.read())
+    print("OK" if titles and got > 0 else f"listed {titles}, downloaded {got} bytes")
+PY
+)
+[ "$UNSYNCED" = "OK" ] && ok "a folder the reader does not sync is still browsable and pullable" \
+                       || bad "the unsynced folder is not in the reader's catalog: $UNSYNCED"
+# Off the books again so the removal rails later in the run see the shelf alone.
+curl -sS -X DELETE "$API/api/libraries/$LOOSELIB" >/dev/null
+rm -rf "$LOOSE"
 
 # Same rails as the rest of the API: no writes, and no browsing as somebody the
 # config has never heard of (reading state keys on the person).

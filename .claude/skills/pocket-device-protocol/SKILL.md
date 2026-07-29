@@ -156,6 +156,30 @@ round trip when the fingerprint of what the reader accepted still matches, and l
 the user set up themselves alone unless forced. Whether `GET /api/settings` answers is treated as
 unknown — every path has to work without it.
 
+### The document hash the reader reports
+
+Binary matching means KOReader's `util.partialMD5`: 1 KiB sampled at `bit.lshift(1024, 2*i)` for
+`i` in −1..10. **Those offsets are not `1024 * 4^i`.** LuaJIT takes a shift count modulo 32, so
+`i = -1` shifts left by 30, overflows 32 bits and wraps to **offset 0** — the head of the file. The
+arithmetic reading starts at 256 instead, and then every digest is wrong, every report maps to no
+book, and nothing anywhere errors: the reader gets its 200, asks for the position back, is answered
+`{}`, and shows the book at page one "updated by null". `koreaderPartialMd5()` in `src/core/hash.ts`
+holds the offsets and `tests/acceptance.sh` step 18b walks the whole loop against an independent
+transcription of the Lua.
+
+Because hashes are recorded only when a book is *sent*, changing how they are computed strands every
+book already on a reader. `DOCUMENT_HASH_VERSION` + `remapDeliveredDocuments()` in
+`src/sync/engine.ts` re-derive them once at the next start; bump the constant with any such change.
+
+The reader's locator (`progress`) is opaque to us and must be stored and handed back **verbatim** —
+a percentage with no locator opens the book at the start, which is indistinguishable from no sync at
+all.
+
+A hash that maps to no book is a **side-loaded** file, not an error: the reader holds books we never
+sent, and their positions are kept against the hash alone in `unmapped_progress` and served back.
+Anything that answers `PUT /syncs/progress` with a shrug shows up on the device as page sync being
+broken, because the reader is answered either way and only finds out when it reads back nothing.
+
 ### WebSocket upload — `ws://<host>:<port>/`
 
 1. text `START:<filename>:<size>:<path>` (`<path>` = target **directory**)

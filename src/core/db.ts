@@ -296,6 +296,30 @@ const MIGRATIONS: string[] = [
   ALTER TABLE device_settings ADD COLUMN opds_detail TEXT;
   ALTER TABLE device_settings ADD COLUMN opds_at     TEXT;
   `,
+
+  // v7 — positions for files we did not deliver.
+  //
+  // A reader holds side-loaded books too, and their document hash matches no
+  // row in `kosync_document` — nor can it ever, since we have never seen those
+  // bytes. Dropping the report made page sync look broken on exactly the book
+  // someone was testing with: the reader is answered, reads back nothing, and
+  // opens at page one. Keyed by the document hash rather than a book, because a
+  // book is the one thing we do not have.
+  //
+  // Not folded into `reading_state`: that table is joined into the library and
+  // swept by `reconcile()` against known books, and a row with an invented
+  // book_id would surface as a phantom or be deleted as an orphan.
+  `
+  CREATE TABLE unmapped_progress (
+    user_id       TEXT NOT NULL,
+    document_hash TEXT NOT NULL,
+    percentage    REAL NOT NULL DEFAULT 0,
+    payload_json  TEXT NOT NULL DEFAULT '{}',
+    device_id     TEXT,
+    updated_at    TEXT NOT NULL,
+    PRIMARY KEY (user_id, document_hash)
+  );
+  `,
 ];
 
 export class Db {

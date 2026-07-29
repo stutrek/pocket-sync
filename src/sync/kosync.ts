@@ -7,7 +7,7 @@ import type { DeviceKosyncSettings } from "../device/client.ts";
 import type { DeviceManager } from "../device/manager.ts";
 import type { ConfigStore, SyncServerConfig, UserConfig } from "../core/config.ts";
 import { LOCAL_SYNC_SERVER_ID } from "../core/config.ts";
-import type { ProgressPayload, Reading } from "./reading.ts";
+import { type ProgressPayload, type Reading, storedReport } from "./reading.ts";
 
 /**
  * A sync server as the rest of the app sees it: the stored record for someone
@@ -442,13 +442,19 @@ export class KosyncServer {
       if (!payload?.document) return json({ message: "document is required" }, 400);
       // The user comes from the credentials, never from the reported device
       // name — see `credentials()`. The device is recorded for display only.
-      const { bookId } = this.reading.record(payload, userId, this.#deviceFor(payload));
+      const deviceId = this.#deviceFor(payload);
+      const { bookId } = this.reading.record(payload, userId, deviceId);
       if (!bookId) {
-        // Not a book we delivered. Accept it so the reader doesn't retry
-        // forever, but say so in the log.
-        this.log.debug(
+        // A side-loaded book: on the reader, but not one we sent, so its hash
+        // maps to nothing. Keep the position against the hash itself — being a
+        // sync server for the whole device costs one row, and dropping it is
+        // indistinguishable from page sync being broken, since the reader is
+        // answered either way.
+        this.reading.recordUnmapped(payload, userId, deviceId);
+        this.log.info(
           "kosync.unmapped",
-          `Progress for unknown document ${payload.document} from ${payload.device ?? "reader"}`,
+          `Saved a position from ${payload.device ?? "a reader"} in a book Pocket Sync did not ` +
+            `send it (document ${payload.document}) — it syncs, but has no shelf entry`,
         );
       }
       return json({
@@ -463,14 +469,39 @@ export class KosyncServer {
       // Scoped to the authenticated user, so one reader can never pull back
       // another household member's position for the same book.
       const state = bookId ? this.reading.get(userId, bookId) : undefined;
-      if (!state) return json({});
+      // A book we sent, or a side-loaded one kept against its hash alone. Both
+      // answer the reader with its own position; only the first has a shelf
+      // entry to show it on.
+      const stored = state ?? this.reading.unmapped(userId, document);
+      if (!stored) {
+        // An empty body is the protocol's "no position stored", and the reader
+        // renders it as page one reported by nobody. That is the shape of every
+        // failure upstream of here, so say which one it was.
+        this.log.info(
+          "kosync.no-progress",
+          bookId
+            ? `No stored position yet for the book behind document ${document}`
+            : `A reader asked for a position in document ${document}, which nothing has ` +
+              `reported on yet`,
+          { bookId: bookId ?? undefined },
+        );
+        return json({});
+      }
+      const report = storedReport(
+        "position_json" in stored ? stored.position_json : stored.payload_json,
+      );
       return json({
         document,
-        percentage: state.percentage,
-        progress: JSON.parse(state.position_json || "{}").xpath ?? "",
-        device: "Pocket Sync",
-        device_id: state.device_id ?? "pocket-sync",
-        timestamp: Math.floor(new Date(state.updated_at).getTime() / 1000),
+        percentage: stored.percentage,
+        // Verbatim, because only the reader knows how to read its own locator.
+        progress: report.progress ?? report.position?.xpath ?? "",
+        position: report.position,
+        // Which reader was last there, as it named itself — this is printed on
+        // the device ("updated by …"), so our own name would be a lie and a
+        // missing one prints as "null".
+        device: report.device ?? "Pocket Sync",
+        device_id: report.device_id ?? stored.device_id ?? "pocket-sync",
+        timestamp: Math.floor(new Date(stored.updated_at).getTime() / 1000),
       });
     }
 

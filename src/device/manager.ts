@@ -217,9 +217,13 @@ export class DeviceManager {
       }
       if (seen.size) this.#lastContactAt = new Date().toISOString();
 
-      // Anything previously online but missing this sweep is gone.
+      // Anything previously online but missing this sweep is gone — unless we
+      // are mid-sync with it, which is better proof of a connection than a
+      // probe: a reader streaming an upload routinely misses the 4s
+      // /api/status timeout, and calling that "lost" greys the dot and logs a
+      // disconnect for a device we are actively talking to.
       for (const [id, st] of this.#state) {
-        if (st.online && !seen.has(id)) {
+        if (st.online && !seen.has(id) && !st.syncing) {
           st.online = false;
           this.log.info("device.lost", `Device ${this.label(id)} went offline`, { deviceId: id });
         }

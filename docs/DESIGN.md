@@ -198,6 +198,14 @@ New `src/library/scanner.ts`:
 - **Settle check** before importing — wait for `size` and `mtime` to stop changing — so a
   half-written download is never ingested. Ignore `.part`, `.crdownload`, `.DS_Store`, dotfiles.
 - Accepted extensions come from `ACCEPTED_EXTS` in `src/library/ingest.ts`.
+- **One book in several formats is one book.** `Dune.epub` and `Dune.mobi` hash differently, so
+  content identity cannot catch them and the reader would show the title twice. `groupEditions()`
+  gathers them by `editionKey()` — the filename, normalized, ignoring the directory, because every
+  layout that produces these pairs repeats the name (Calibre's per-book folder, a download folder, a
+  library split into `epub/` and `mobi/` trees) — and only the best format is imported, so the MOBI
+  is never hashed or converted at all. Files of the _same_ format are two editions rather than two
+  formats and both stand; a format that will not import (a DRM'd EPUB beside a plain MOBI) falls
+  through to the next best rather than costing the book.
 - **Hash cache**: MD5 keyed on `(path, size, mtime)` in a new `file_index` table, so a rescan only
   rehashes changed files. This is what makes content-addressed identity affordable.
 - Changes are published on the existing `EventBus` (`src/core/events.ts`).
@@ -258,7 +266,29 @@ send    = desired − present          remove = present − desired
 
 - **Delivered filename** is `Title - Author.epub` via the existing `sanitizeForFilename()` in
   `src/core/ids.ts`, which already handles the firmware's FAT-ish charset, with a deterministic
-  tiebreak on collision. `deviceFilename()` and `bookIdFromDeviceFilename()` are retired.
+  tiebreak on collision. Spaces are kept: this is a name read off a reader's screen, and it is safe
+  everywhere the name travels — the upload handshake is colon-delimited and colons are among the
+  characters dropped, device paths are URL-encoded into `/api/files` and `/download`, and `/delete`
+  carries them inside a JSON array. `bookIdFromDeviceFilename()` is retired.
+- **Delivered location mirrors the watched folder, under the folder's own name.** A book filed under
+  `Sci-Fi/` in a folder called "Hunger Games Trilogy" is filed under `Hunger Games Trilogy/Sci-Fi/`
+  on the reader, below the upload path (`devicePlacements()`, fed by `relativeDirSegments()`). The
+  folder name is the top level because the upload path defaults to `/` and a reader commonly syncs
+  several folders: without it they all merge, and a collection that happens to be flat on disk
+  becomes indistinguishable from every other one. It is the folder's _label_, not its basename, so
+  renaming a folder moves its books — the same cost as reorganizing the folder itself, which is the
+  behaviour it should match. "This folder is on my reader" covers the arrangement, not just the
+  contents, and nothing invents a hierarchy the user did not make. Depth is capped at
+  `MIRROR_MAX_DEPTH`: the firmware creates one level per request, and a book below `listEpubs()`'s
+  recursion limit would be invisible to us and re-sent on every sync. A name therefore only has to
+  be unique within its folder.
+- **Moving a book is send-then-delete**, because the firmware has no rename. Anything whose recorded
+  `device_path` is not where it now belongs is re-sent and the old copy removed once the new one has
+  landed. It is not a removal — the book stays on the reader — so it is counted as a send in
+  `plan()` and kept clear of the removal-confirmation rail. Folders that a departing book emptied
+  are pruned upwards towards the upload path, one folder at a time, and only the ones we emptied:
+  the upload path defaults to `/`, where a general sweep for empty folders would delete the user's
+  own.
 - **Re-identification** moves from the filename into an embedded `<meta>` in the delivered EPUB's
   OPF carrying the source MD5. The optimizer already rewrites the file, so it costs nothing, and it
   survives the user renaming files on the device — which the filename scheme did not. Recovery is
@@ -303,11 +333,27 @@ two different hashes, and only we know they are one book.
   `GET /syncs/progress/{document}`. Auth headers `x-auth-user` and `x-auth-key` (lowercase 32-hex
   MD5 of the password).
 - Store the whole payload including CrossPoint's `position` extensions (`pctQ`, `spine`, `page`,
-  `para`, `anchor`) opaquely, so we don't discard data we don't yet use.
+  `para`, `anchor`) opaquely, so we don't discard data we don't yet use — and hand the reader's own
+  `progress` locator back **verbatim** on the next request. A percentage with no locator puts the
+  book at page one, which on the device is indistinguishable from never having synced.
 - **Two different hashes — do not conflate them.** `bookId` is the MD5 of the _source_ file; the
   kosync `document` is a hash of the _delivered_ bytes. Record `document → bookId` at delivery time,
   when both are in hand. Being the server means the exact hash method can be confirmed empirically
   from the first real request rather than guessed.
+  - Binary matching is KOReader's `util.partialMD5`, whose offsets are `1024 << 2i` **in 32 bits**
+    for `i` in −1..10 — the first wraps to 0, not 256 (see the `pocket-device-protocol` skill). Get
+    it wrong and every report maps to nothing while every request still succeeds, which is why
+    `tests/acceptance.sh` walks the reader's full round trip rather than trusting the mapping.
+  - Mappings are written only when a book is **sent**, so a change to the hashing strands every book
+    already on a reader. `DOCUMENT_HASH_VERSION` and `remapDeliveredDocuments()` re-derive them once
+    at the next start.
+- **A document we cannot map is still a position worth keeping.** A reader holds side-loaded books
+  too, whose hash matches nothing of ours and never can. Their positions are stored against the hash
+  alone (`unmapped_progress`, keyed by user like everything else here) and served back. Mapping to a
+  book is the value we add, not a precondition for being a correct sync server — and dropping the
+  report is indistinguishable, from the device, from page sync being broken: the reader is answered
+  either way, then reads back nothing and opens at page one. These rows deliberately stay out of
+  `reading_state`, which is joined into the library and swept against known books.
 - **Attribution is by credential, not by device name.** Each _user_ gets their own kosync username
   and password (`kosync_user.user_id`). Two people holding the same file produce the same document
   hash, so a report is written against the user who authenticated and nobody else. The reported

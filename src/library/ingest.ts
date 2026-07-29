@@ -49,6 +49,44 @@ export const ACCEPTED_EXTS = [
   "azw8",
 ];
 
+/**
+ * Which format of the same book to prefer, best first.
+ *
+ * The device only reads EPUB, so this is really "how much is lost getting
+ * there": an EPUB needs no conversion at all, the Kindle formats reflow
+ * cleanly, and a PDF is the last real choice because its fixed layout converts
+ * badly. The tokens at the end are not books — a `.acsm` next to a book is the
+ * receipt that fetched it, and KFX is a dead end — so they win only when
+ * nothing else carries the same title, which is what keeps them visible in the
+ * Inbox rather than silently dropped.
+ *
+ * Anything not listed sorts last but still ahead of nothing.
+ */
+const FORMAT_ORDER = [
+  "epub",
+  "azw3",
+  "mobi",
+  "azw",
+  "prc",
+  "pdb",
+  "lit",
+  "fb2",
+  "cbz",
+  "cbr",
+  "docx",
+  "rtf",
+  "html",
+  "htm",
+  "md",
+  "markdown",
+  "pdf",
+  "txt",
+  "acsm",
+  "kfx",
+  "kfx-zip",
+  "azw8",
+];
+
 export type Stage = "hashing" | "drm" | "metadata" | "converting" | "ready";
 
 export function extOf(pathOrName: string): string {
@@ -58,6 +96,36 @@ export function extOf(pathOrName: string): string {
 
 export function basenameOf(path: string): string {
   return path.replace(/\\/g, "/").split("/").pop() ?? path;
+}
+
+/** Lower is better. Equal ranks are the same format and never supersede. */
+export function formatRank(ext: string): number {
+  const i = FORMAT_ORDER.indexOf(ext.toLowerCase());
+  return i === -1 ? FORMAT_ORDER.length : i;
+}
+
+/**
+ * What two files share when they are one book in two formats.
+ *
+ * Content hashing cannot see this: `Dune.epub` and `Dune.mobi` are the same
+ * book but not the same bytes, so both import and the reader shows the title
+ * twice. The filename is the only evidence available before conversion, and
+ * every layout that produces these pairs preserves it — Calibre keeps its
+ * formats side by side as `Title - Author.epub|.mobi`, a download folder gets
+ * both from the same purchase, and a library split into `epub/` and `mobi/`
+ * trees repeats the name in each. So the key ignores the directory.
+ *
+ * Punctuation and case are normalized because the same name reaches disk
+ * spelled differently, but nothing more aggressive: two *editions* of one title
+ * are also a real thing, and they are told apart by extension rather than here
+ * (see `groupEditions()`).
+ */
+export function editionKey(pathOrName: string): string {
+  const name = basenameOf(pathOrName);
+  const dot = name.lastIndexOf(".");
+  const stem = dot > 0 ? name.slice(0, dot) : name;
+  const key = stem.toLowerCase().replace(/[_\s]+/g, " ").trim();
+  return key || name.toLowerCase();
 }
 
 /**

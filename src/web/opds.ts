@@ -42,9 +42,9 @@ import type { ConfigStore } from "../core/config.ts";
 import type { Logger } from "../core/log.ts";
 import { lanAddress } from "../core/net.ts";
 import type { Book, Books, LibraryRow, ReadingFilter } from "../library/books.ts";
-import type { Scanner } from "../library/scanner.ts";
 import type { DeviceManager } from "../device/manager.ts";
 import type { SyncEngine } from "../sync/engine.ts";
+import { relativeDirSegments } from "../sync/engine.ts";
 import type { Profiles, ResampleProfile } from "../sync/profiles.ts";
 
 const ATOM = "http://www.w3.org/2005/Atom";
@@ -64,13 +64,11 @@ const PAGE_SIZE = 50;
  * Calibre — which gets the original unless it asks for a profile by id.
  */
 interface Scope {
-  /** Whose reading state decorates the feed, and whose shelf it is. */
+  /** Whose reading state decorates the feed. */
   userId: string | null;
   /** Null for a user scope: no device, so nothing to resample for. */
   deviceId: string | null;
   profile: ResampleProfile | null;
-  /** Null means every watched folder; a device is limited to its bound ones. */
-  libraryIds: string[] | null;
   /** Absolute prefix every link in the feed is built from. */
   base: string;
   title: string;
@@ -86,7 +84,6 @@ export class OpdsServer {
     private readonly config: ConfigStore,
     private readonly books: Books,
     private readonly devices: DeviceManager,
-    private readonly scanner: Scanner,
     private readonly sync: SyncEngine,
     private readonly profiles: Profiles,
     private readonly log: Logger,
@@ -158,10 +155,9 @@ export class OpdsServer {
       userId: user.userId,
       deviceId,
       profile: this.sync.profileFor(deviceId),
-      // The same set sync would send: the union of the folders bound to this
-      // reader. A catalog showing more than that is a different shelf from the
-      // one the device already has, which is confusing rather than generous.
-      libraryIds: this.scanner.librariesForDevice(deviceId).map((l) => l.id),
+      // Every watched folder, not just the ones bound to this reader. Sync is
+      // what a device is *given*; the catalog is what it can *go and get*, and
+      // the whole point of pulling is to reach a book the push never sent.
       base: `${origin}/opds/d/${encodeURIComponent(deviceId)}`,
       title: row.name || "Pocket Sync",
     };
@@ -179,7 +175,6 @@ export class OpdsServer {
       // No device means no hardware to match, so the original is the honest
       // default; a client that knows what it is running can name a profile.
       profile: profileId ? this.profiles.get(profileId) ?? null : null,
-      libraryIds: null,
       base: `${origin}/opds`,
       title: "Pocket Sync",
     };
@@ -231,15 +226,15 @@ export class OpdsServer {
 
     const page = Math.max(0, Math.trunc(Number(url.searchParams.get("page")) || 0));
 
-    const folder = rest.match(/^\/folder\/([^/]+)$/);
+    // `/folder/<library>` and `/folder/<library>/<subfolder path>`, the second
+    // percent-encoded whole so its own slashes stay inside one segment.
+    const folder = rest.match(/^\/folder\/([^/]+)(?:\/([^/]*))?$/);
     if (folder) {
       const id = decodeURIComponent(folder[1]);
-      // A device may only browse the folders it is bound to — otherwise the
-      // folder feed would quietly reach past the shelf the root feed showed.
-      if (scope.libraryIds && !scope.libraryIds.includes(id)) return notFound();
       const lib = this.config.current.libraries.find((l) => l.id === id);
       if (!lib) return notFound();
-      return this.#acquisition(scope, lib.name, rest, page, { libraryId: id });
+      const relDir = safeSegments(folder[2] ? decodeURIComponent(folder[2]) : "");
+      return this.#folder(scope, lib, relDir, rest, page, url.searchParams.get("all") === "1");
     }
 
     if (rest === "/all") return this.#acquisition(scope, "All books", rest, page, {});
@@ -261,7 +256,7 @@ export class OpdsServer {
     if (book) return await this.#download(scope, decodeURIComponent(book[1]));
 
     const image = rest.match(/^\/(cover|thumb)\/([^/]+)$/);
-    if (image) return await this.#cover(scope, decodeURIComponent(image[2]));
+    if (image) return await this.#cover(decodeURIComponent(image[2]));
 
     return notFound();
   }
@@ -287,18 +282,122 @@ export class OpdsServer {
     });
   }
 
+  /** Every watched folder, whether or not the reader asking syncs it — see
+   * `#deviceScope()`. */
   #folders(scope: Scope): Response {
-    const all = this.config.current.libraries;
-    const visible = scope.libraryIds ? all.filter((l) => scope.libraryIds!.includes(l.id)) : all;
+    const libraries = this.config.current.libraries;
     return feed(NAV_TYPE, {
       id: `${scope.base}/folders`,
       title: "Folders",
       base: scope.base,
       selfHref: `${scope.base}/folders`,
-      entries: visible.map((l) =>
-        navEntry(scope, l.name, "", `/folder/${encodeURIComponent(l.id)}`, ACQ_TYPE)
+      // The type has to say which kind of feed the entry actually leads to —
+      // some readers refuse to open an entry whose type does not match — and a
+      // watched folder leads to navigation or straight to books depending on
+      // whether it has subfolders.
+      entries: libraries.map((l) =>
+        navEntry(
+          scope,
+          l.name,
+          "",
+          `/folder/${encodeURIComponent(l.id)}`,
+          this.#subfolders(l, []).length ? NAV_TYPE : ACQ_TYPE,
+        )
       ),
     });
+  }
+
+  /**
+   * One watched folder, browsable exactly as it sits on disk.
+   *
+   * The sync engine already mirrors that structure onto a reader
+   * (`placementsFor()`), so a catalog that flattened it would be the only place
+   * the arrangement stopped being true. Both read the same evidence — the
+   * source path of each book — through `relativeDirSegments()`.
+   *
+   * A folder with subfolders answers with a **navigation** feed: its subfolders,
+   * then "All books in …", which lists everything below it recursively. The
+   * aggregate matters — it is what keeps every book reachable by browsing on a
+   * client that renders only acquisition entries, and it is what this feed did
+   * before there were subfolders at all. A folder with no subfolders skips
+   * straight to the books, because an intermediate page offering one choice is
+   * just a page.
+   */
+  #folder(
+    scope: Scope,
+    lib: { id: string; name: string; path: string },
+    relDir: string[],
+    self: string,
+    page: number,
+    all: boolean,
+  ): Response {
+    const here = relDir.length ? [lib.name, ...relDir].join(" / ") : lib.name;
+    const prefix = `${lib.path.replace(/\\/g, "/").replace(/\/+$/, "")}/${
+      relDir.length ? `${relDir.join("/")}/` : ""
+    }`;
+    const subfolders = this.#subfolders(lib, relDir);
+
+    if (all || !subfolders.length) {
+      return this.#acquisition(scope, here, self, page, {
+        libraryId: lib.id,
+        pathPrefix: prefix,
+        all,
+      });
+    }
+
+    const dirHref = (segs: string[]) =>
+      `/folder/${encodeURIComponent(lib.id)}${
+        segs.length ? `/${encodeURIComponent(segs.join("/"))}` : ""
+      }`;
+
+    return feed(NAV_TYPE, {
+      id: `${scope.base}${self}`,
+      title: here,
+      base: scope.base,
+      selfHref: `${scope.base}${self}`,
+      entries: [
+        ...subfolders.map((sub) =>
+          navEntry(
+            scope,
+            sub.name,
+            `${sub.books} book${sub.books === 1 ? "" : "s"}`,
+            dirHref([...relDir, sub.name]),
+            NAV_TYPE,
+          )
+        ),
+        navEntry(
+          scope,
+          `All books in ${relDir.at(-1) ?? lib.name}`,
+          "Everything in this folder, including its subfolders",
+          `${dirHref(relDir)}?all=1`,
+          ACQ_TYPE,
+        ),
+      ],
+    });
+  }
+
+  /**
+   * The immediate subfolders of `relDir`, and how many books sit anywhere below
+   * each — derived from where the books are, so a folder exists here only while
+   * it still holds something. Depth is deliberately uncapped, unlike the device
+   * layout, which truncates at `MIRROR_MAX_DEPTH` for the firmware's sake:
+   * browsing has no round trips to pay for and no reason to hide a level.
+   */
+  #subfolders(
+    lib: { id: string; path: string },
+    relDir: string[],
+  ): { name: string; books: number }[] {
+    const counts = new Map<string, number>();
+    for (const path of this.books.pathsIn(lib.id)) {
+      const segs = relativeDirSegments(path, lib.path, Infinity);
+      if (segs.length <= relDir.length) continue;
+      if (!relDir.every((seg, i) => segs[i] === seg)) continue;
+      const name = segs[relDir.length];
+      counts.set(name, (counts.get(name) ?? 0) + 1);
+    }
+    return [...counts]
+      .map(([name, books]) => ({ name, books }))
+      .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" }));
   }
 
   #openSearch(scope: Scope): Response {
@@ -323,44 +422,28 @@ export class OpdsServer {
     title: string,
     self: string,
     page: number,
-    q: { libraryId?: string; reading?: ReadingFilter; query?: string; recent?: boolean },
+    q: {
+      libraryId?: string;
+      reading?: ReadingFilter;
+      query?: string;
+      recent?: boolean;
+      pathPrefix?: string;
+      /** Set on a folder's "All books" feed, which has to stay `all=1` across
+       * its own paging or page 2 lands back on the folder's subfolder list. */
+      all?: boolean;
+    },
   ): Response {
-    let rows: LibraryRow[] = [];
-    if (scope.libraryIds && !scope.libraryIds.length) {
-      // Bound to nothing: an empty shelf, not every book in the library.
-      rows = [];
-    } else if (q.libraryId || !scope.libraryIds) {
-      rows = this.books.list({
-        userId: scope.userId ?? undefined,
-        libraryId: q.libraryId,
-        reading: q.reading,
-        query: q.query,
-        limit: PAGE_SIZE + 1,
-        offset: page * PAGE_SIZE,
-      });
-    } else {
-      // `Books.list` filters one folder at a time, so a device bound to several
-      // is the union of them, deduplicated — the same file in two folders is
-      // one book and must appear once (invariant 7).
-      const seen = new Set<string>();
-      const merged: LibraryRow[] = [];
-      for (const id of scope.libraryIds) {
-        for (
-          const row of this.books.list({
-            userId: scope.userId ?? undefined,
-            libraryId: id,
-            reading: q.reading,
-            query: q.query,
-          })
-        ) {
-          if (seen.has(row.id)) continue;
-          seen.add(row.id);
-          merged.push(row);
-        }
-      }
-      merged.sort((a, b) => a.title.localeCompare(b.title, undefined, { sensitivity: "base" }));
-      rows = merged.slice(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE + 1);
-    }
+    // One book per row whichever scope is asking: `Books.list` collapses a file
+    // held by two folders into one row (invariant 7), so paging can stay in SQL.
+    let rows = this.books.list({
+      userId: scope.userId ?? undefined,
+      libraryId: q.libraryId,
+      pathPrefix: q.pathPrefix,
+      reading: q.reading,
+      query: q.query,
+      limit: PAGE_SIZE + 1,
+      offset: page * PAGE_SIZE,
+    });
 
     if (q.recent) {
       rows = [...rows].sort((a, b) => b.added_at.localeCompare(a.added_at));
@@ -373,6 +456,7 @@ export class OpdsServer {
     // everything.
     const params = new URLSearchParams();
     if (q.query) params.set("q", q.query);
+    if (q.all) params.set("all", "1");
     const href = (n: number) => {
       const p = new URLSearchParams(params);
       if (n > 0) p.set("page", String(n));
@@ -429,17 +513,9 @@ ${
 
   // --- bytes ---
 
-  /** Every book route checks the scope, not just the feeds — otherwise a
-   * device could download past the shelf its own feed showed it. */
-  #inScope(scope: Scope, book: Book): boolean {
-    if (!scope.libraryIds) return true;
-    const held = this.books.librariesFor(book.id).map((l) => l.library_id);
-    return held.some((id) => scope.libraryIds!.includes(id));
-  }
-
   async #download(scope: Scope, bookId: string): Promise<Response> {
     const book = this.books.get(bookId);
-    if (!book?.epub_path || !this.#inScope(scope, book)) return notFound();
+    if (!book?.epub_path) return notFound();
 
     let path: string;
     try {
@@ -484,9 +560,9 @@ ${
     });
   }
 
-  async #cover(scope: Scope, bookId: string): Promise<Response> {
+  async #cover(bookId: string): Promise<Response> {
     const book = this.books.get(bookId);
-    if (!book?.cover_path || !this.#inScope(scope, book)) return notFound();
+    if (!book?.cover_path) return notFound();
     try {
       const bytes = await Deno.readFile(book.cover_path);
       return new Response(bytes, {
@@ -634,6 +710,21 @@ export function asciiFilename(book: Pick<Book, "id" | "title" | "author">): stri
   // fields — "-" is not a filename, so fall back to the id rather than to
   // whatever survived the strip.
   return `${/[A-Za-z0-9]/.test(base) ? base : book.id}.epub`;
+}
+
+/**
+ * A folder path from a URL, reduced to plain names.
+ *
+ * Nothing here ever opens a file — a subfolder is only matched against paths
+ * already in the index — but `..` and empty segments would still be a way to
+ * ask for a folder that cannot exist, and dropping them means such a request
+ * lands on the parent rather than on something surprising.
+ */
+export function safeSegments(rel: string): string[] {
+  return rel
+    .replace(/\\/g, "/")
+    .split("/")
+    .filter((s) => s && s !== "." && s !== "..");
 }
 
 const notFound = () => new Response("Not found", { status: 404 });

@@ -2,10 +2,15 @@ import { bit, type Db } from "../core/db.ts";
 import type { ConfigStore } from "../core/config.ts";
 import type { EventBus } from "../core/events.ts";
 import { koreaderPartialMd5, md5File } from "../core/hash.ts";
-import { deviceFilenames, legacyBookIdFromFilename, shortHash } from "../core/ids.ts";
+import {
+  type DevicePlacement,
+  devicePlacements,
+  legacyBookIdFromFilename,
+  shortHash,
+} from "../core/ids.ts";
 import type { Logger } from "../core/log.ts";
 import { isLocalUrl } from "../core/net.ts";
-import type { DeviceClient } from "../device/client.ts";
+import type { DeviceClient, DeviceFile } from "../device/client.ts";
 import { joinDevicePath, normalizeDevicePath } from "../device/client.ts";
 import type { DeviceManager } from "../device/manager.ts";
 import type { Sidecar } from "../engine/sidecar.ts";
@@ -66,6 +71,17 @@ export interface ReaderConfigResult {
 /** Removing more than this many books in one sync needs confirmation. */
 export const REMOVAL_CONFIRM_THRESHOLD = 5;
 
+/**
+ * How deep the mirrored folder structure may go below the upload path.
+ *
+ * Two reasons, and the smaller number wins: the firmware creates one level per
+ * request, so depth costs round trips; and `listEpubs()` gives up below 8
+ * levels, at which point a delivered book becomes invisible to us and would be
+ * sent again on every single sync. Anything deeper is truncated to its top
+ * levels, which keeps the grouping the user arranged.
+ */
+export const MIRROR_MAX_DEPTH = 4;
+
 /** How our entry is labelled in the reader's own catalog list, and the key we
  * find it by so a re-push edits it instead of appending a duplicate. */
 export const CATALOG_NAME = "Pocket Sync";
@@ -92,6 +108,16 @@ export interface SyncOptions {
   /** Proceed with removals that crossed the confirmation threshold. */
   confirmRemovals?: boolean;
 }
+
+/**
+ * How the hashes in `kosync_document` are computed. Bump it whenever that
+ * changes, and every book already on a reader is re-identified once at the next
+ * start — see `remapDeliveredDocuments()`.
+ *
+ * 2: `koreaderPartialMd5` sampled from offset 256 instead of 0, so no report a
+ *    reader made ever matched a book.
+ */
+const DOCUMENT_HASH_VERSION = "2";
 
 export class SyncEngine {
   #running = new Set<string>();
@@ -537,6 +563,62 @@ export class SyncEngine {
   }
 
   /**
+   * Where every book in these folders belongs on a device.
+   *
+   * **The watched folder's own name is the top level**, and whatever
+   * arrangement sits inside it follows: `Hunger Games Trilogy/` on the reader,
+   * and a book filed under `Sci-Fi/` on disk lands in
+   * `Hunger Games Trilogy/Sci-Fi/`. Without that first level a reader syncing
+   * several folders merges them all into the upload path — which defaults to
+   * `/` — and a collection that happens to be flat on disk becomes
+   * indistinguishable from every other one. Nothing here invents a hierarchy
+   * below that: the rest is the user's own.
+   *
+   * The name is the folder's *label* rather than its basename on disk, because
+   * that is what the user sees and what the catalog shows. Renaming a folder
+   * therefore moves its books on every reader — a real cost, and the same one
+   * as reorganizing the folder itself, which is the behaviour it should match.
+   *
+   * Computed for the whole set at once because a name only has to be unique
+   * within its own folder, and the tiebreak must not depend on the order books
+   * happen to go out.
+   */
+  placementsFor(
+    libs: { id: string; name: string; path: string }[],
+  ): Map<string, DevicePlacement & { devicePath: string }> {
+    const targetDir = normalizeDevicePath(this.config.current.upload.path || "/");
+    const libraryIds = libs.map((l) => l.id);
+    const roots = new Map(libs.map((l) => [l.id, { name: l.name, path: l.path }]));
+    const sources = this.books.sourcePathsForLibraries(libraryIds);
+
+    const placements = devicePlacements(
+      this.books.idsForLibraries(libraryIds)
+        .map((id) => this.books.get(id))
+        .filter((b): b is Book => !!b)
+        .map((b) => {
+          const src = sources.get(b.id);
+          const lib = src ? roots.get(src.libraryId) : undefined;
+          // The cap covers the whole path, folder name included — it is about
+          // how deep the firmware is asked to go, not about how much of it we
+          // contributed.
+          const relDir = lib
+            ? [lib.name, ...relativeDirSegments(src!.path, lib.path)].slice(0, MIRROR_MAX_DEPTH)
+            : [];
+          return { id: b.id, title: b.title, author: b.author, relDir };
+        }),
+    );
+
+    const out = new Map<string, DevicePlacement & { devicePath: string }>();
+    for (const [id, place] of placements) {
+      out.set(id, {
+        ...place,
+        devicePath: joinDevicePath([targetDir, ...place.dir].join("/"), place.filename),
+      });
+    }
+    return out;
+  }
+
+  /**
    * What the next sync would do, without touching the device. Backs the
    * "will send N / remove N" preview.
    */
@@ -547,15 +629,23 @@ export class SyncEngine {
       return { folders, send: 0, remove: 0, onDevice: 0, needsConfirm: false };
     }
     const desired = new Set(this.books.idsForLibraries(libs.map((l) => l.id)));
-    const present = this.db.all<{ book_id: string }>(
-      "SELECT book_id FROM device_content WHERE device_id = ?",
+    const present = this.db.all<{ book_id: string; device_path: string }>(
+      "SELECT book_id, device_path FROM device_content WHERE device_id = ?",
       deviceId,
-    ).map((r) => r.book_id);
-    const presentSet = new Set(present);
-    const remove = present.filter((id) => !desired.has(id)).length;
+    );
+    const presentSet = new Set(present.map((r) => r.book_id));
+    const remove = present.filter((r) => !desired.has(r.book_id)).length;
+    // A book on the reader in the wrong place is re-sent, not left — so the
+    // preview has to count it, or "0 to send" would be followed by a sync that
+    // moves half the shelf.
+    const placements = this.placementsFor(libs);
+    const misplaced = present.filter((r) =>
+      desired.has(r.book_id) &&
+      normalizeDevicePath(r.device_path) !== placements.get(r.book_id)?.devicePath
+    ).length;
     return {
       folders,
-      send: [...desired].filter((id) => !presentSet.has(id)).length,
+      send: [...desired].filter((id) => !presentSet.has(id)).length + misplaced,
       remove,
       onDevice: present.length,
       /**
@@ -752,8 +842,34 @@ export class SyncEngine {
     // 3. desired set — everything across all the bound folders
     const desired = this.books.idsForLibraries(libs.map((l) => l.id));
     const desiredSet = new Set(desired);
-    const toSend = desired.filter((id) => !presentBooks.has(id));
+
+    // Where each of them belongs, and which are somewhere else. A book moves
+    // when the folder it sits in on disk changes, when its title or author is
+    // edited, and once for everybody when the naming scheme itself changes —
+    // the firmware has no rename, so moving means sending it again and deleting
+    // the old copy after the new one lands. Deliberately *not* counted as a
+    // removal: the book stays on the reader, so this must not trip the
+    // confirmation rail that exists to catch a folder going missing.
+    const placements = this.placementsFor(libs);
+    const relocations = new Map<string, string>(); // bookId -> where it is now
+    for (const [id, current] of presentBooks) {
+      if (!desiredSet.has(id)) continue;
+      const want = placements.get(id)?.devicePath;
+      if (want && normalizeDevicePath(current) !== want) relocations.set(id, current);
+    }
+
+    /** Folders a departing book may have been the last thing in. */
+    const emptied = new Set<string>();
+
+    const toSend = desired.filter((id) => !presentBooks.has(id) || relocations.has(id));
     const upToDate = desired.length - toSend.length;
+    if (relocations.size) {
+      this.log.info(
+        "sync.relocating",
+        `Moving ${relocations.size} book(s) on ${label} into their folders`,
+        { deviceId, detail: { count: relocations.size } },
+      );
+    }
 
     // 4. remove what the folder no longer holds, plus any old-scheme leftovers.
     const stale = [...presentBooks.entries()].filter(([id]) => !desiredSet.has(id));
@@ -790,6 +906,7 @@ export class SyncEngine {
           );
         }
         deleted = removalPaths.length;
+        for (const path of removalPaths) emptied.add(parentDevicePath(normalizeDevicePath(path)));
         this.log.info("sync.deleted", `Removed ${deleted} book(s) from ${label}`, {
           deviceId,
           detail: { paths: removalPaths.slice(0, 20) },
@@ -808,27 +925,16 @@ export class SyncEngine {
 
     // 5. upload
     const targetDir = normalizeDevicePath(cfg.upload.path || "/");
-    if (targetDir !== "/") {
-      try {
-        await client.ensureDir("/", targetDir.split("/").filter(Boolean));
-      } catch (err) {
-        this.log.warn("sync.mkdir.failed", `Could not create ${targetDir}: ${err}`, { deviceId });
-      }
-    }
+    // Folders created during this run. The firmware makes one level per request
+    // and every existence check is a round trip, so a folder holding fifty
+    // books must not cost fifty listings.
+    const madeDirs = new Set<string>(["/"]);
+    await this.#ensureDeviceDir(client, deviceId, targetDir, madeDirs);
 
     let sent = 0;
     let failed = 0;
     let connectionLost = false;
     let stopped = false;
-
-    // Names are assigned across the whole desired set at once so a title clash
-    // resolves the same way regardless of the order books happen to go out.
-    const names = deviceFilenames(
-      desired
-        .map((id) => this.books.get(id))
-        .filter((b): b is NonNullable<typeof b> => !!b)
-        .map((b) => ({ id: b.id, title: b.title, author: b.author })),
-    );
 
     for (const [index, bookId] of toSend.entries()) {
       // Sending a large folder takes minutes, and the user can unbind or remove
@@ -878,12 +984,18 @@ export class SyncEngine {
         continue;
       }
 
-      const filename = names.get(book.id) ?? `${book.id}.epub`;
-      const devicePath = joinDevicePath(targetDir, filename);
+      const placement = placements.get(book.id);
+      const filename = placement?.filename ?? `${book.id}.epub`;
+      const bookDir = placement?.dir.length
+        ? joinDevicePath(targetDir, placement.dir.join("/"))
+        : targetDir;
+      const devicePath = placement?.devicePath ?? joinDevicePath(targetDir, filename);
+      // The upload handshake writes into a directory; it does not create one.
+      await this.#ensureDeviceDir(client, deviceId, bookDir, madeDirs);
       const ok = await this.#uploadWithRetry(client, deviceId, book.id, book.title, {
         host: client.hostname,
         port: client.wsPort,
-        uploadPath: targetDir,
+        uploadPath: bookDir,
         filename,
         filePath: sendPath,
         devicePath,
@@ -908,6 +1020,20 @@ export class SyncEngine {
           profile ? profile.id : null,
           new Date().toISOString(),
         );
+        // A move is only finished once the new copy is on the reader: delete
+        // the old one now, never before, so a failed upload leaves the book
+        // where it was rather than nowhere.
+        const cameFrom = relocations.get(book.id);
+        if (cameFrom) {
+          emptied.add(parentDevicePath(normalizeDevicePath(cameFrom)));
+          await client.delete([cameFrom]).catch((err) =>
+            this.log.warn(
+              "sync.relocate.cleanup",
+              `Moved “${book.title}” but could not remove the old copy at ${cameFrom}: ${err}`,
+              { deviceId, bookId: book.id },
+            )
+          );
+        }
         this.#logSync(deviceId, book.id, "info", "sync.book.done", `Sent “${book.title}”`);
         if (cfg.upload.bookCooldownSec > 0 && index < toSend.length - 1) {
           await sleep(cfg.upload.bookCooldownSec * 1000);
@@ -927,6 +1053,12 @@ export class SyncEngine {
       }
     }
 
+    // Mirroring means folders come and go with the books in them: a book that
+    // left, or moved, can strand the folder it was the last occupant of, and an
+    // empty folder on the reader's shelf is litter the user has to clear by
+    // hand.
+    if (emptied.size) await this.#pruneEmptied(client, deviceId, emptied, targetDir);
+
     const durationMs = performance.now() - t0;
     const message = stopped
       ? `Stopped: ${sent} sent before the folder was removed`
@@ -939,6 +1071,72 @@ export class SyncEngine {
       { deviceId, detail: { sent, failed, deleted, upToDate, trigger } },
     );
     return { deviceId, started, durationMs, sent, failed, deleted, upToDate, message };
+  }
+
+  /**
+   * Make sure a folder exists on the device, at most once per run.
+   *
+   * Never throws: a folder we could not create makes the books bound for it
+   * fail one by one, which is reported per book — the same as any other upload
+   * failure, and better than aborting a sync that has other folders to deliver.
+   */
+  async #ensureDeviceDir(
+    client: DeviceClient,
+    deviceId: string,
+    dir: string,
+    made: Set<string>,
+  ): Promise<void> {
+    const path = normalizeDevicePath(dir);
+    if (made.has(path)) return;
+    try {
+      await client.ensureDir("/", path.split("/").filter(Boolean));
+      made.add(path);
+    } catch (err) {
+      this.log.warn("sync.mkdir.failed", `Could not create ${path}: ${err}`, { deviceId });
+    }
+  }
+
+  /**
+   * Remove the folders that the books we just deleted or moved were the last
+   * occupants of, walking up towards the upload path.
+   *
+   * Deliberately scoped to folders we emptied ourselves rather than sweeping
+   * the device for empty ones: the upload path defaults to `/`, so a sweep
+   * would cheerfully delete an empty folder the user made, or one the firmware
+   * keeps for its own reasons. Stops at the first folder that still holds
+   * something — including a file nobody here put there — and at anything it
+   * cannot list, since "unreadable" must not read as "empty" on a device any
+   * more than it does on a watched folder.
+   */
+  async #pruneEmptied(
+    client: DeviceClient,
+    deviceId: string,
+    dirs: Set<string>,
+    stopAt: string,
+  ): Promise<void> {
+    const root = normalizeDevicePath(stopAt);
+    const inside = (p: string) => root === "/" ? p !== "/" : p.startsWith(`${root}/`);
+
+    for (const start of dirs) {
+      let dir = normalizeDevicePath(start);
+      while (inside(dir)) {
+        let entries: DeviceFile[];
+        try {
+          entries = await client.listDir(dir);
+        } catch {
+          break;
+        }
+        if (entries.length) break;
+        try {
+          await client.delete([dir]);
+        } catch (err) {
+          this.log.debug("sync.prune.failed", `Could not remove ${dir}: ${err}`, { deviceId });
+          break;
+        }
+        this.log.debug("sync.prune", `Removed the now-empty folder ${dir}`, { deviceId });
+        dir = parentDevicePath(dir);
+      }
+    }
   }
 
   /** Upload one book, retrying with backoff and cleaning up partial files. */
@@ -1081,6 +1279,72 @@ export class SyncEngine {
   }
 
   /**
+   * Re-derive the document hashes for every book already delivered.
+   *
+   * `#mapKosyncDocument` runs only when a book is *sent*, so a correction to how
+   * a hash is computed would otherwise reach only books a reader has yet to
+   * receive — everything already on a device would keep reporting its position
+   * into nothing, with no sign of it beyond a line in the log. Keyed by
+   * `DOCUMENT_HASH_VERSION`, so it runs once per correction and not on every
+   * start; bump that constant whenever `koreaderPartialMd5` or the set of
+   * hashes recorded changes.
+   *
+   * Safe to repeat and safe to interrupt: each row is an upsert keyed on the
+   * hash, and the marker is only written once every book is done.
+   */
+  async remapDeliveredDocuments(): Promise<void> {
+    const KEY = "kosync.document.hash.version";
+    const done = this.db.get<{ value: string }>(
+      "SELECT value FROM setting WHERE key = ?",
+      KEY,
+    )?.value;
+    if (done === DOCUMENT_HASH_VERSION) return;
+
+    const rows = this.db.all<{ book_id: string }>(
+      `SELECT book_id FROM device_content
+       UNION
+       SELECT book_id FROM kosync_document`,
+    );
+    if (!rows.length) {
+      this.db.run(
+        `INSERT INTO setting (key, value) VALUES (?, ?)
+         ON CONFLICT (key) DO UPDATE SET value = excluded.value`,
+        KEY,
+        DOCUMENT_HASH_VERSION,
+      );
+      return;
+    }
+
+    const started = performance.now();
+    let books = 0;
+    for (const { book_id } of rows) {
+      const book = this.books.get(book_id);
+      // The optimized copies are the bytes that actually went to a reader; the
+      // converted EPUB only did if the device syncs with no profile at all.
+      const paths = await this.profiles.cachedCopies(book_id);
+      if (book?.epub_path) paths.push(book.epub_path);
+      for (const path of paths) {
+        // A cached copy can be deleted under us; the stale mapping it leaves is
+        // harmless, so a miss is skipped rather than aborting the pass.
+        await this.#mapKosyncDocument(path, book_id, null);
+      }
+      if (paths.length) books++;
+    }
+
+    this.db.run(
+      `INSERT INTO setting (key, value) VALUES (?, ?)
+       ON CONFLICT (key) DO UPDATE SET value = excluded.value`,
+      KEY,
+      DOCUMENT_HASH_VERSION,
+    );
+    this.log.info(
+      "kosync.remapped",
+      `Re-identified ${books} already-delivered book(s) for page sync in ` +
+        `${((performance.now() - started) / 1000).toFixed(1)}s`,
+    );
+  }
+
+  /**
    * Remember how the reader will refer to this file. CrossPoint reports a
    * 32-hex MD5 but which one is not documented, so both candidates over the
    * delivered bytes are recorded and whichever arrives resolves (docs/DESIGN.md).
@@ -1115,6 +1379,40 @@ export class SyncEngine {
       detail,
     );
   }
+}
+
+/**
+ * The folders a source file sits in, relative to its watched folder — the
+ * structure the device mirrors.
+ *
+ * Pure, and it answers "no folders" rather than guessing whenever the file is
+ * not plainly under the root it was indexed from: the alternative is a path
+ * assembled from a mismatched prefix, which would scatter books into folders
+ * named after fragments of somebody's home directory. Both strings come from
+ * the same walk (`file_index.path` is built from `LibraryConfig.path`), so they
+ * agree in case and spelling; if they ever don't, flat is the safe answer.
+ */
+export function relativeDirSegments(
+  sourcePath: string,
+  libraryRoot: string,
+  maxDepth = MIRROR_MAX_DEPTH,
+): string[] {
+  const path = sourcePath.replace(/\\/g, "/");
+  const root = libraryRoot.replace(/\\/g, "/").replace(/\/+$/, "");
+  if (!root || !path.startsWith(`${root}/`)) return [];
+  return path
+    .slice(root.length + 1)
+    .split("/")
+    .slice(0, -1) // the filename is named by `deviceFilename()`, not by disk
+    .filter(Boolean)
+    .slice(0, maxDepth);
+}
+
+/** The folder holding a device path. `/` is its own parent. */
+export function parentDevicePath(path: string): string {
+  const normalized = normalizeDevicePath(path);
+  const cut = normalized.lastIndexOf("/");
+  return cut > 0 ? normalized.slice(0, cut) : "/";
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));

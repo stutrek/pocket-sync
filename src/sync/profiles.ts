@@ -170,6 +170,22 @@ export class Profiles {
     }
   }
 
+  /**
+   * Every optimized copy of a book on disk, one per profile it has been sent
+   * under. These are the exact bytes a reader holds, so anything derived from
+   * what we delivered — a document hash, a size — is derived from these.
+   */
+  async cachedCopies(bookId: string): Promise<string[]> {
+    const dir = this.paths.bookDir(bookId);
+    const out: string[] = [];
+    try {
+      for await (const entry of Deno.readDir(dir)) {
+        if (entry.isFile && entry.name.startsWith("opt-")) out.push(`${dir}/${entry.name}`);
+      }
+    } catch { /* no such book dir */ }
+    return out;
+  }
+
   /** Drop cached optimized copies for a book (all profiles). */
   async clearCache(bookId: string) {
     try {

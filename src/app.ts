@@ -122,7 +122,6 @@ export class App {
       this.config,
       this.books,
       this.devices,
-      this.scanner,
       this.sync,
       this.profiles,
       this.log,
@@ -199,6 +198,13 @@ export class App {
     this.sync.backfillProfiles();
     await this.kosync.applyConfig();
     await this.opds.applyConfig();
+    // Re-identifies books already on a reader after a change to how document
+    // hashes are computed. Reads every delivered file, so it runs alongside
+    // startup rather than in front of it; page sync for books already on a
+    // device simply starts working partway through.
+    this.sync.remapDeliveredDocuments().catch((err) =>
+      this.log.warn("kosync.remap.failed", `Could not re-identify delivered books: ${err}`)
+    );
   }
 
   /**

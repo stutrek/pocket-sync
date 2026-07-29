@@ -7,7 +7,7 @@ description: How to verify changes to Pocket Sync without a physical e-reader â€
 
 ```bash
 deno task test         # unit tests: ids, hashing, DRM detection, reading state, metadata
-deno task acceptance   # end-to-end against a simulated reader (must stay green, currently 51 checks)
+deno task acceptance   # end-to-end against a simulated reader (must stay green, currently 68 checks)
 deno task check        # type-check + lint + fmt
 ```
 

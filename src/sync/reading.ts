@@ -16,6 +16,16 @@ export interface ReadingState {
   updated_at: string;
 }
 
+/** A position in a side-loaded file, which has no book to belong to. */
+export interface UnmappedProgress {
+  user_id: string;
+  document_hash: string;
+  percentage: number;
+  payload_json: string;
+  device_id: string | null;
+  updated_at: string;
+}
+
 /** The payload CrossPoint/KOReader sends, plus CrossPoint's richer position. */
 export interface ProgressPayload {
   document: string;
@@ -25,6 +35,24 @@ export interface ProgressPayload {
   device_id?: string;
   timestamp?: number;
   position?: Record<string, unknown>;
+}
+
+/**
+ * The report as it arrived, parsed back out of `position_json`.
+ *
+ * Old rows hold only the `position` object, so this reads either shape — a
+ * stored row with no `document` is a pre-round-trip one and its `position`
+ * fields are all there ever was.
+ */
+export function storedReport(positionJson: string): ProgressPayload {
+  let raw: Record<string, unknown>;
+  try {
+    raw = JSON.parse(positionJson || "{}") ?? {};
+  } catch {
+    return { document: "" };
+  }
+  if (typeof raw.document === "string") return raw as unknown as ProgressPayload;
+  return { document: "", position: raw };
 }
 
 /**
@@ -104,7 +132,11 @@ export class Reading {
       userId,
       bookId,
       pct,
-      JSON.stringify(payload.position ?? {}),
+      // The whole report, opaquely (docs/DESIGN.md). The reader asks for its
+      // location back verbatim on the next sync, and anything we drop here it
+      // never gets — a stored percentage with no location reads on the device
+      // as "you are at the start".
+      JSON.stringify(payload),
       finished,
       source,
       deviceId,
@@ -121,9 +153,49 @@ export class Reading {
     return { bookId };
   }
 
+  /**
+   * A position in a file we did not deliver — a side-loaded book.
+   *
+   * Its document hash matches no book of ours and never will: we have never
+   * seen those bytes, so there is nothing to map them to. Keeping the report
+   * anyway makes us a correct sync server for everything on the reader rather
+   * than only for what we sent, and costs one row. Without it, the reader is
+   * answered, reads back nothing, and opens the book at page one — which is
+   * exactly what "page sync is broken" looks like from the device.
+   *
+   * Keyed by the hash and the user, on the same rule as everything else here:
+   * two people with the same side-loaded file stay independent.
+   */
+  recordUnmapped(payload: ProgressPayload, userId: string, deviceId: string | null) {
+    this.db.run(
+      `INSERT INTO unmapped_progress (user_id, document_hash, percentage, payload_json,
+                                      device_id, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT (user_id, document_hash) DO UPDATE SET
+         percentage = excluded.percentage, payload_json = excluded.payload_json,
+         device_id = excluded.device_id, updated_at = excluded.updated_at`,
+      userId,
+      payload.document,
+      clampPercentage(payload),
+      JSON.stringify(payload),
+      deviceId,
+      new Date().toISOString(),
+    );
+  }
+
+  /** The stored position for a file we did not deliver, if there is one. */
+  unmapped(userId: string, documentHash: string): UnmappedProgress | undefined {
+    return this.db.get<UnmappedProgress>(
+      "SELECT * FROM unmapped_progress WHERE user_id = ? AND document_hash = ?",
+      userId,
+      documentHash,
+    );
+  }
+
   /** Drop a departed user's positions. */
   forgetUser(userId: string) {
     this.db.run("DELETE FROM reading_state WHERE user_id = ?", userId);
+    this.db.run("DELETE FROM unmapped_progress WHERE user_id = ?", userId);
   }
 
   /** Manual override — the reader only reports when the user taps sync. */

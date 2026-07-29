@@ -103,12 +103,52 @@ reader taps "Sync Progress" → kosync listener → document hash → book → r
 7. **Book identity is the MD5 of the source file** and nothing else, cached against
    `(path, size, mtime)` in `file_index`. Derived artifacts are keyed by it, so two folders holding
    the same file share one optimized copy and a rename is a no-op.
+
+   **What it cannot catch is one book in two formats.** `Dune.epub` and `Dune.mobi` are different
+   bytes, so `groupEditions()` in `src/library/scanner.ts` groups them by filename and imports only
+   the best format (`formatRank()`), before the loser is ever hashed or converted. Same-format files
+   are separate editions and both stand; an import that blocks falls through to the next format.
+   Anything that adds a new way into the index has to go through that grouping too, or duplicates
+   come back.
 8. **Device identity is never the IP.** It comes from a stable `/api/status` field; the
    address-bound fallback is a last resort and is surfaced in the UI.
-9. **Device filenames are human readable** (`Title - Author.epub`, via `deviceFilenames()`, which
-   breaks collisions deterministically). Identity travels in the EPUB's OPF as
-   `pocketsync-source-md5`, stamped by the sidecar's `stamp` command — not in the filename.
-   `legacyBookIdFromFilename()` exists only so files from the old scheme stay attributable.
+9. **The device mirrors the watched folder, with names a person can read.** `devicePlacements()` in
+   `src/core/ids.ts` puts each book in `Title - Author.epub` — spaces, not underscores — under the
+   watched folder's **own name**, then the folders it sits in on disk. That first level is
+   load-bearing: the upload path defaults to `/` and a reader usually syncs several folders, so
+   without it they merge and a flat collection is indistinguishable from every other one. It is the
+   folder's label rather than its basename, so a rename relocates its books (`relativeDirSegments()`
+   in `src/sync/engine.ts`, whole path capped at `MIRROR_MAX_DEPTH`, well under `listEpubs()`'s
+   recursion limit so a delivered book is never invisible and re-sent forever). Names are assigned
+   for the whole set at once and only have to be unique **within a folder**; collisions break on a
+   slice of the content hash. Identity travels in the EPUB's OPF as `pocketsync-source-md5`, stamped
+   by the sidecar's `stamp` command — not in the filename or the path. `legacyBookIdFromFilename()`
+   exists only so files from the old scheme stay attributable.
+
+   **The firmware has no rename, so moving a book is send-then-delete.** A book whose recorded
+   `device_path` is not where it now belongs — the folder changed on disk, the title was edited, the
+   scheme itself changed — is re-sent and the old copy deleted _after_ the new one lands, so a
+   failed upload leaves it where it was rather than nowhere. A relocation is not a removal: keep it
+   out of `REMOVAL_CONFIRM_THRESHOLD`, which exists to catch a folder going missing, and count it in
+   `plan()` or the preview says "nothing to send" before moving half the shelf. Folders emptied by a
+   removal or a move are pruned upwards — only the ones we emptied, never a sweep for empty folders,
+   because the upload path defaults to `/` and the reader has folders of its own.
+
+   **The catalog browses the same tree** (`#folder()` / `#subfolders()` in `src/web/opds.ts`, off
+   the same `relativeDirSegments()`), so the arrangement is not true in one delivery path and
+   flattened in the other. A folder with subfolders answers with a navigation feed — its subfolders,
+   then an "All books in …" acquisition feed that is **recursive**, which is what keeps every book
+   reachable on a client that renders only acquisition entries. A folder without subfolders skips
+   straight to the books. The `type` on each entry link has to match the feed it actually leads to;
+   some readers refuse to open an entry whose type is a lie, so `#folders()` decides per library.
+   Note what OPDS cannot do: the reader names and files a downloaded book itself, so the layout
+   applies to pushed books only.
+
+   **The catalog spans every watched folder; sync spans the bound ones.** A device scope in
+   `src/web/opds.ts` picks the resample profile and the person, not a shelf: pushing is what a
+   reader is given, pulling is what it can go and get, and a folder deliberately left off the sync
+   list is exactly the one somebody browses for. Nothing below `/opds` filters by folder binding —
+   don't reintroduce it.
 
    **Every route that hands book bytes to a device goes through `SyncEngine.prepareForDevice()`** —
    resample for the profile, stamp the OPF, record both document hashes. The upload loop and the
@@ -147,7 +187,7 @@ reader taps "Sync Progress" → kosync listener → document hash → book → r
 ## Testing expectations
 
 Any change touching the scanner, ingest, optimization, the device client or the sync engine should
-keep `deno task acceptance` green (51 checks) — it runs against a simulated reader and unpacks the
+keep `deno task acceptance` green (68 checks) — it runs against a simulated reader and unpacks the
 delivered EPUBs to check they are genuinely device-safe. It binds port 8899 and aborts if that is
 taken, so it can never drive a running `deno task dev` against your real library. See `pocket-test`.
 
