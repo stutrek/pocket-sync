@@ -1,68 +1,62 @@
-// One person's shelf. Folder ticks here are a bulk edit across every reader
-// they currently hold — the binding itself stays per device (docs/DESIGN.md),
-// so a reader assigned to them later does not inherit anything.
-import { api, errText } from "./api.ts";
+// One person: what they are reading, what their readers carry, and their
+// page-sync login.
+//
+// This page used to be the whole library with a half-ticked box on every folder
+// — a bulk edit disguised as a shelf, which docs/DESIGN.md already flagged as
+// uncomfortable. Folder rules belong to a reader, so they are set on the
+// reader's page; this page is about the person.
+import { useState } from "preact/hooks";
+import { api } from "./api.ts";
+import { groupsFor } from "./grouping.ts";
 import { Shelf } from "./Shelf.tsx";
-import type { Bound } from "./Shelf.tsx";
-import {
-  devices,
-  libraries,
-  loadDevices,
-  loadLibraries,
-  loadUsers,
-  setScope,
-  toast,
-  users,
-} from "./store.ts";
-import type { Library } from "./types.ts";
+import { books, devices, groupBy, libraries, loadUsers, setScope, users } from "./store.ts";
 
-export function UserView({ id }: { id: string }) {
+export function UserView({ id, target }: { id: string; target: string | null }) {
+  const [renaming, setRenaming] = useState(false);
   const user = users.value.find((u) => u.id === id);
   if (!user) return <p class="empty">This person is no longer listed.</p>;
 
   const theirs = devices.value.filter((d) => user.deviceIds.includes(d.id));
-
-  const state = (folder: Library): Bound => {
-    if (!user.deviceIds.length) return "off";
-    const on = user.deviceIds.filter((d) => folder.deviceIds.includes(d)).length;
-    return on === 0 ? "off" : on === user.deviceIds.length ? "on" : "partial";
-  };
-
   const defaultServer = user.syncServers?.find((s) => s.id === user.defaultSyncServerId);
 
-  const toggle = async (folder: Library, on: boolean) => {
-    const deviceIds = on
-      ? [...new Set([...folder.deviceIds, ...user.deviceIds])]
-      : folder.deviceIds.filter((d) => !user.deviceIds.includes(d));
-    try {
-      await api("PUT", `/api/libraries/${folder.id}`, { deviceIds });
-      await Promise.all([loadLibraries(), loadDevices()]);
-    } catch (err) {
-      toast(errText(err), "error");
-    }
-  };
+  const present = new Set(books.value.map((b) => b.library_id));
+  const folders = libraries.value.filter((l) => present.has(l.id));
+  const groups = groupsFor(books.value, folders, groupBy.value);
 
   return (
     <div class="scope-view">
       <header class="scope-head">
-        <h2>{user.name}</h2>
-        <span class="muted">
-          {theirs.length
-            ? theirs.map((d) => d.name || d.model || d.id).join(", ")
-            : "no reader assigned"}
-        </span>
+        {renaming
+          ? (
+            <input
+              value={user.name}
+              autoFocus
+              onBlur={async (e) => {
+                setRenaming(false);
+                const next = e.currentTarget.value.trim();
+                if (next && next !== user.name) {
+                  await api("PUT", `/api/users/${user.id}`, { name: next });
+                  loadUsers();
+                }
+              }}
+              onKeyDown={(e) => e.key === "Enter" && e.currentTarget.blur()}
+            />
+          )
+          : <h2 onClick={() => setRenaming(true)} title="Click to rename">{user.name}</h2>}
         <span class="spacer" />
-        <button
-          type="button"
-          onClick={async () => {
-            const next = prompt("Name", user.name);
-            if (!next?.trim()) return;
-            await api("PUT", `/api/users/${user.id}`, { name: next.trim() });
-            loadUsers();
-          }}
-        >
-          Rename
-        </button>
+        {theirs.length
+          ? theirs.map((d) => (
+            <button
+              key={d.id}
+              type="button"
+              class="link"
+              onClick={() => setScope({ kind: "device", id: d.id })}
+            >
+              <span class={`dot${d.state.online ? " ok" : ""}`} />
+              {d.name || d.model || d.id}
+            </button>
+          ))
+          : <span class="muted small">no reader assigned</span>}
       </header>
 
       {
@@ -71,51 +65,30 @@ export function UserView({ id }: { id: string }) {
           sync server would otherwise be handed credentials that do not work
           there. */
       }
-      <p class="muted small">
-        Ticking a folder here sends it to{" "}
-        {theirs.length > 1 ? `all ${theirs.length} of ${user.name}'s readers` : "their reader"}.
-        {defaultServer && (
-          <>
-            {" "}Page-sync login on <strong>{defaultServer.name}</strong>:{" "}
-            <code>{defaultServer.username || "—"}</code>{" "}
-            <code>{defaultServer.password || "—"}</code>
-          </>
-        )} — the full list is under <strong>Settings → Page sync</strong>.
-      </p>
-
-      {theirs.length === 0 && (
-        <p class="muted">
-          Assign a reader to {user.name} first — open one under <strong>Unassigned readers</strong>
+      {defaultServer && (
+        <p class="muted small">
+          Page-sync login on <strong>{defaultServer.name}</strong>:{" "}
+          <code>{defaultServer.username || "—"}</code> <code>{defaultServer.password || "—"}</code>
           {" "}
-          and set its user. Until then there is nothing for a folder tick to reach.
+          — the full list is under <strong>Settings → Page sync</strong>.
         </p>
       )}
 
       <Shelf
-        folders={libraries.value}
-        binding={{
-          state,
-          toggle,
-          label: theirs.length === 1
-            ? `Sync to ${theirs[0].name || theirs[0].model || "their reader"}`
-            : `Sync to ${user.name}'s readers`,
-          disabledReason: theirs.length === 0 ? "no reader" : undefined,
-        }}
+        groups={groups}
+        target={target}
+        empty={
+          <p class="empty">
+            {theirs.length ? <>Nothing on {user.name}'s readers yet, and nothing started.</> : (
+              <>
+                {user.name} has no reader yet. Open one under <strong>Unassigned readers</strong>
+                {" "}
+                and set them as its holder.
+              </>
+            )}
+          </p>
+        }
       />
-
-      {theirs.length > 0 && (
-        <p class="muted small">
-          Per-reader differences show as a half-ticked box. Open{" "}
-          <button
-            type="button"
-            class="link"
-            onClick={() => setScope({ kind: "device", id: theirs[0].id })}
-          >
-            {theirs[0].name || theirs[0].model || theirs[0].id}
-          </button>{" "}
-          to set folders for one reader alone.
-        </p>
-      )}
     </div>
   );
 }

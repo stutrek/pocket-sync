@@ -1,10 +1,14 @@
-// The shelf: every watched folder as a collapsible section of covers. All three
-// scopes — the whole library, a person, a reader — render this same component,
-// because they differ only in which folders are bound and who is reading.
+// The shelf: headed sections of covers, whatever the sections happen to be.
+//
+// It knows nothing about scopes or bindings any more. It is handed groups
+// (`grouping.ts`) and the reader a Send button means, and renders them — which
+// is what lets the library, a person and a reader all use it while each showing
+// its own contents.
+import type { ComponentChildren } from "preact";
 import { useState } from "preact/hooks";
 import { api, errText } from "./api.ts";
+import type { Group } from "./grouping.ts";
 import {
-  books,
   detailBookId,
   devices,
   folderOpen,
@@ -14,132 +18,112 @@ import {
   progress,
   query,
   readingFilter,
-  scope,
   selection,
   selectMode,
+  send,
   setFolderOpen,
   toast,
   toggleSelected,
-  users,
 } from "./store.ts";
-import type { Library, LibraryBook } from "./types.ts";
-
-/** Tri-state because a person's folder may reach only some of their readers. */
-export type Bound = "on" | "off" | "partial";
+import type { LibraryBook } from "./types.ts";
 
 /**
- * A book's standing with the readers this view is about: already there, on its
- * way, or going nowhere. Which readers those are depends on the scope — one
- * reader's page asks about that reader, a person's page about theirs, and the
- * whole library about every reader the folder feeds.
+ * How a book stands with the reader the view is about.
+ *
+ * "there by rule" and "sent by hand" both mean the book is on the reader, and
+ * they look identical — but only one of them can be undone from here. Collapsing
+ * them would put an un-send button on a book a folder rule would immediately put
+ * back, which is the sort of thing that teaches people not to trust a control.
  */
-type Sync = "synced" | "pending" | "unsynced";
+export type Standing = "absent" | "sending" | "queued" | "byRule" | "byHand";
 
-function targetsFor(folder: Library): string[] {
-  const s = scope.value;
-  if (s.kind === "device") return folder.deviceIds.includes(s.id) ? [s.id] : [];
-  if (s.kind === "user") {
-    const held = users.value.find((u) => u.id === s.id)?.deviceIds ?? [];
-    return folder.deviceIds.filter((id) => held.includes(id));
-  }
-  return folder.deviceIds;
-}
-
-function syncState(book: LibraryBook, targets: string[]): Sync {
-  if (!targets.length) return "unsynced";
-  return targets.every((id) => book.onDevices.includes(id)) ? "synced" : "pending";
+export function standingOf(
+  book: LibraryBook,
+  deviceId: string | null,
+  uploading: boolean,
+): Standing {
+  if (!deviceId) return "absent";
+  const on = book.onDevices.includes(deviceId);
+  const byHand = book.pinnedTo.includes(deviceId);
+  if (uploading) return "sending";
+  if (on) return byHand ? "byHand" : "byRule";
+  return byHand ? "queued" : "absent";
 }
 
 export interface ShelfProps {
-  folders: Library[];
-  /** Omitted in the whole-library view, which binds nothing. */
-  binding?: {
-    state: (folder: Library) => Bound;
-    toggle: (folder: Library, on: boolean) => void | Promise<void>;
-    /** Set when ticking would have nowhere to write — shown instead of a checkbox. */
-    disabledReason?: string;
-    label: string;
-  };
+  groups: Group[];
+  /** The reader a Send button acts on. Null when there is none to send to. */
+  target: string | null;
+  /** Shown when there are no groups at all — each scope has its own reason. */
+  empty?: ComponentChildren;
 }
 
-export function Shelf({ folders, binding }: ShelfProps) {
+export function Shelf({ groups, target, empty }: ShelfProps) {
   const [hot, setHot] = useState<string | null>(null);
 
-  // While searching or filtering, a collapsed folder would hide its own matches,
+  // While searching or filtering, a collapsed group would hide its own matches,
   // so groups open themselves and empty ones drop out of the way entirely.
   const filtering = query.value !== "" || readingFilter.value !== "all";
+  const shown = filtering ? groups.filter((g) => g.books.length) : groups;
 
-  const grouped = new Map<string, LibraryBook[]>();
-  for (const book of books.value) {
-    const list = grouped.get(book.library_id);
-    if (list) list.push(book);
-    else grouped.set(book.library_id, [book]);
-  }
-
-  if (!folders.length) return null;
-
-  // Filtering hides whole folders, so with no matches left there would be
-  // nothing on screen at all to say what happened.
-  const shown = filtering ? folders.filter((f) => grouped.has(f.id)) : folders;
+  if (!groups.length) return <>{empty}</>;
   if (!shown.length) {
     return <p class="empty">Nothing matches. Clear the search or the reading filter.</p>;
   }
 
   return (
     <div class="shelf">
-      {shown.map((folder) => {
-        const rows = grouped.get(folder.id) ?? [];
-        const state = binding?.state(folder) ?? "on";
-        const targets = targetsFor(folder);
-        // An unticked folder is reference material here, not the point of the
-        // view, so it starts out of the way — until the user says otherwise.
-        const open = folderOpen.value[folder.id] ?? (filtering || state !== "off");
+      {shown.map((group) => {
+        const open = folderOpen.value[group.key] ??
+          (filtering || !group.closedByDefault);
 
         return (
           <section
-            key={folder.id}
-            class={`folder-group${state === "off" ? " unbound" : ""}${
-              hot === folder.id ? " hot" : ""
-            }`}
-            onDragEnter={(e) => {
-              e.preventDefault();
-              setHot(folder.id);
-            }}
-            onDragOver={(e) => {
-              e.preventDefault();
-              setHot(folder.id);
-            }}
+            key={group.key}
+            class={`folder-group${hot === group.key ? " hot" : ""}`}
+            onDragEnter={group.dropTo
+              ? (e) => {
+                e.preventDefault();
+                setHot(group.key);
+              }
+              : undefined}
+            onDragOver={group.dropTo
+              ? (e) => {
+                e.preventDefault();
+                setHot(group.key);
+              }
+              : undefined}
             onDragLeave={(e) => {
               if (e.currentTarget === e.target) setHot(null);
             }}
-            onDrop={(e) => {
-              e.preventDefault();
-              e.stopPropagation();
-              setHot(null);
-              uploadTo(folder.id, Array.from(e.dataTransfer?.files ?? []));
-            }}
+            onDrop={group.dropTo
+              ? (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                setHot(null);
+                uploadTo(group.dropTo!, Array.from(e.dataTransfer?.files ?? []));
+              }
+              : undefined}
           >
-            <FolderHead
-              folder={folder}
-              count={rows.length}
-              open={open}
-              binding={binding}
-              state={state}
-            />
+            <GroupHead group={group} open={open} />
 
             {open && (
-              rows.length
+              group.books.length
                 ? (
                   <div class="grid">
-                    {rows.map((book) => (
-                      <Card key={book.id} book={book} sync={syncState(book, targets)} />
-                    ))}
+                    {group.books.map((book) => <Card key={book.id} book={book} target={target} />)}
                   </div>
                 )
-                : <p class="muted small">Nothing here yet — drop books onto this folder to add.</p>
+                : (
+                  <p class="muted small">
+                    {group.dropTo
+                      ? "Nothing here yet — drop books onto this folder to add."
+                      : "Nothing here yet."}
+                  </p>
+                )
             )}
 
-            {hot === folder.id && <div class="drop-overlay">{`Add to ${folder.name}`}</div>}
+            {hot === group.key && <div class="drop-overlay">{`Add to ${group.label}`}</div>}
           </section>
         );
       })}
@@ -147,62 +131,27 @@ export function Shelf({ folders, binding }: ShelfProps) {
   );
 }
 
-function FolderHead(
-  { folder, count, open, binding, state }: {
-    folder: Library;
-    count: number;
-    open: boolean;
-    binding?: ShelfProps["binding"];
-    state: Bound;
-  },
-) {
-  const readers = devices.value.filter((d) => folder.deviceIds.includes(d.id));
-
+function GroupHead({ group, open }: { group: Group; open: boolean }) {
   return (
     <header class="folder-head">
       <button
         type="button"
         class="link caret"
-        title={folder.path}
-        onClick={() => setFolderOpen(folder.id, !open)}
+        onClick={() => setFolderOpen(group.key, !open)}
       >
-        {open ? "▾" : "▸"} {folder.name}
+        {open ? "▾" : "▸"} {group.label}
       </button>
-      <span class="muted small">{count}</span>
-
-      {!binding && readers.length > 0 && (
-        <span class="muted small">
-          {`→ ${readers.map((d) => d.name || d.model || d.id).join(", ")}`}
-        </span>
-      )}
-
-      <span class="spacer" />
-
-      {binding && (
-        binding.disabledReason
-          ? <span class="muted small">{binding.disabledReason}</span>
-          : (
-            <label class="check">
-              <input
-                type="checkbox"
-                checked={state === "on"}
-                // Half-ticked has no HTML attribute, only a DOM property.
-                ref={(el) => {
-                  if (el) el.indeterminate = state === "partial";
-                }}
-                onChange={(e) => binding.toggle(folder, e.currentTarget.checked)}
-              />
-              {binding.label}
-            </label>
-          )
-      )}
+      <span class="muted small">{group.books.length}</span>
+      {group.hint && <span class="muted small">{group.hint}</span>}
     </header>
   );
 }
 
 /**
- * Books land in a folder, never in "the library" — so the drop target is the
- * folder section itself and there is nothing to guess about where they go.
+ * Books land in a folder, never in "the library" — so when the shelf is grouped
+ * by folder the section itself is the drop target and there is nothing to guess
+ * about where they go. Other groupings have no folder under the cursor, and the
+ * strip above the shelf asks instead.
  */
 export async function uploadTo(libraryId: string, files: File[]) {
   if (!files.length) return;
@@ -217,47 +166,32 @@ export async function uploadTo(libraryId: string, files: File[]) {
   }
 }
 
-const deviceNames = (ids: string[]) =>
-  ids.map((id) => {
-    const d = devices.value.find((x) => x.id === id);
-    return d?.name || d?.model || id;
-  }).join(", ");
-
-export function Card({ book, sync }: { book: LibraryBook; sync: Sync }) {
+export function Card({ book, target }: { book: LibraryBook; target: string | null }) {
   const isSelected = selection.value.has(book.id);
   const pct = progress.value.get(book.id);
   const open = () => (detailBookId.value = book.id);
   const readPct = Math.round((book.percentage ?? 0) * 100);
-  // Actively uploading is still "on its way", just visibly so.
-  const sending = pct !== undefined;
-  const where = book.onDevices.length ? ` (on ${deviceNames(book.onDevices)})` : "";
-  const hint = sending
-    ? `Sending — ${Math.round((pct ?? 0) * 100)}%`
-    : sync === "synced"
-    ? `On your reader${where}`
-    : sync === "pending"
-    ? `Waiting to send${where}`
-    : `Not set to sync to any reader${where}`;
+  const standing = standingOf(book, target, pct !== undefined);
+  const reader = devices.value.find((d) => d.id === target);
+  const name = reader?.name || reader?.model || "this reader";
 
   return (
     <div class={`card${isSelected ? " selected" : ""}`}>
-      {selectMode.value && (
-        <input
-          type="checkbox"
-          title="Select"
-          checked={isSelected}
-          onChange={(e) => toggleSelected(book.id, e.currentTarget.checked)}
-        />
-      )}
+      {selectMode.value
+        ? (
+          <input
+            type="checkbox"
+            title="Select"
+            checked={isSelected}
+            onChange={(e) => toggleSelected(book.id, e.currentTarget.checked)}
+          />
+        )
+        : target && <SendButton book={book} target={target} name={name} standing={standing} />}
       <div class="cover" onClick={open}>
-        {
-          /* One glyph per book instead of a row of names — at this size the
-            question is only ever "is it on my reader?" */
-        }
         <span
-          class={`sync-dot ${sending ? "pending sending" : sync}`}
-          title={hint}
-          aria-label={hint}
+          class={`sync-dot ${dotClass(standing)}`}
+          title={hint(standing, name, pct)}
+          aria-label={hint(standing, name, pct)}
         />
         {book.hasCover
           ? <img src={`/api/books/${book.id}/cover`} alt="" loading="lazy" />
@@ -271,10 +205,7 @@ export function Card({ book, sync }: { book: LibraryBook; sync: Sync }) {
       <div class="meta" onClick={open}>
         <div class="title" title={book.title}>{book.title}</div>
         <div class="author">{book.author}</div>
-        {
-          /* Where it is now lives in the dot on the cover; this line is only
-            about reading. */
-        }
+        {/* Where it is lives in the dot; this line is only about reading. */}
         <div class="badges">
           {book.finished
             ? <span class="badge finished">finished</span>
@@ -283,4 +214,67 @@ export function Card({ book, sync }: { book: LibraryBook; sync: Sync }) {
       </div>
     </div>
   );
+}
+
+/**
+ * The whole point of the redesign in one control: one book, one reader, one
+ * click.
+ *
+ * A book carried because of a folder rule renders as a state, not a button —
+ * un-sending it would do nothing, because the rule would put it back on the next
+ * sync. The rule is named in the tooltip so the answer to "why can't I remove
+ * this" is in the same place as the question.
+ */
+function SendButton(
+  { book, target, name, standing }: {
+    book: LibraryBook;
+    target: string;
+    name: string;
+    standing: Standing;
+  },
+) {
+  if (standing === "byRule") {
+    return (
+      <span class="send-mark rule" title={`On ${name} — a folder rule syncs it there`}>✓</span>
+    );
+  }
+  const on = standing === "byHand" || standing === "queued" || standing === "sending";
+  return (
+    <button
+      type="button"
+      class={`send-mark${on ? " on" : ""}`}
+      title={hint(standing, name)}
+      aria-label={hint(standing, name)}
+      onClick={(e) => {
+        e.stopPropagation();
+        send(target, [book.id], !on);
+      }}
+    >
+      {on ? "✓" : "＋"}
+    </button>
+  );
+}
+
+const dotClass = (s: Standing) =>
+  s === "sending"
+    ? "pending sending"
+    : s === "queued"
+    ? "pending"
+    : s === "absent"
+    ? "unsynced"
+    : "synced";
+
+function hint(standing: Standing, name: string, pct?: number): string {
+  switch (standing) {
+    case "sending":
+      return `Sending to ${name} — ${Math.round((pct ?? 0) * 100)}%`;
+    case "queued":
+      return `Will send when ${name} is next awake`;
+    case "byRule":
+      return `On ${name} — a folder rule syncs it there`;
+    case "byHand":
+      return `On ${name} — sent by you. Click to take it off.`;
+    case "absent":
+      return `Send to ${name}`;
+  }
 }

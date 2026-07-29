@@ -1,13 +1,16 @@
 # Pocket Sync
 
 A self-hosted book-sync daemon for **Xteink X3/X4** e-readers running **CrossInk / CrossPoint**
-firmware. Point it at a folder of books and that folder _is_ your reader's library — resampled for
-the low-memory device and pushed whenever the reader appears on Wi-Fi. One macOS menu-bar app is
-both the daemon and the UI.
+firmware. Point it at a folder of books, send the ones you want to your reader — resampled for the
+low-memory device and pushed whenever it appears on Wi-Fi. One macOS menu-bar app is both the daemon
+and the UI.
+
+**Sending one book is the basic action; a folder rule automates it.** Press ＋ on a cover to send
+that book to your reader. When you notice you keep sending everything out of one folder, give that
+folder a rule and it keeps itself in step — new files arrive on their own, deleted ones come off.
 
 **The filesystem is the source of truth.** Pocket Sync indexes your folder in place and never writes
-to it; add a file and it syncs, remove one and it comes off the reader. See
-[docs/DESIGN.md](docs/DESIGN.md) for the model and the reasoning behind it.
+to it. See [docs/DESIGN.md](docs/DESIGN.md) for the model and the reasoning behind it.
 
 It is not a Calibre replacement. It drives Calibre's `ebook-convert` for format conversion and
 reuses the CrossPoint plugin's optimizer and protocol client verbatim (see
@@ -62,9 +65,10 @@ deno task desktop     # menu-bar app, built and run from source
 
 ### Choosing your books folder
 
-On first run, pick the one folder that holds your books — Pocket Sync opens your system's folder
-chooser. Everything it watches lives inside that folder, and you tick which folders within it to
-sync.
+On first run, pick the one folder that holds your books — **+ Add books** in the sidebar opens your
+system's folder chooser. Everything it watches lives inside that folder, and you tick which folders
+within it to watch. Watching a folder puts its books in your library; it does not by itself put them
+on a reader.
 
 There is deliberately no way to type a path. Indexed files are readable and deletable through the
 API, so accepting an arbitrary path would make it an arbitrary-file API — a real concern if you ever
@@ -78,10 +82,23 @@ under **Settings → Readers**, put its IP in **Settings → Discovery → manua
 first-class and needs no broadcast. A manual host may include a non-default HTTP port
 (`192.168.1.50:8080`); the upload port comes from discovery, from `/api/status`, or defaults to 81.
 
-A reader appears in the library rail under whoever is holding it. Open it there, say who that is,
-and tick the folders it should carry — or tick them on the person, which applies to every reader
-they hold. Resampling defaults to the reader's model, so there is nothing to choose unless you want
-to. With auto-sync on, waking the reader makes it match those folders.
+The first time a reader turns up, a card at the top of the library asks for a name and who is
+holding it. That is the whole setup: resampling defaults to the reader's model, and page sync and
+the catalog are pushed to it automatically.
+
+After that the reader appears in the rail under its holder, and becomes the destination in the
+toolbar's **Sending to** picker.
+
+### Putting books on it
+
+- **One book:** hover a cover and press **＋**. It goes on the next time the reader is awake.
+- **Several:** press **Select**, tick them, and use **Send N to …**.
+- **A whole folder, always:** open the reader and add a folder rule (`Always send: …`). Everything
+  in that folder stays in step from then on.
+
+A ✓ on a cover means the book is on the reader named in the toolbar. A grey ✓ means a folder rule
+put it there — un-sending would do nothing, because the rule would put it straight back; drop the
+rule instead. Un-sending a book you sent by hand takes it off on the next sync.
 
 ## How syncing works
 
@@ -89,8 +106,8 @@ to. With auto-sync on, waking the reader makes it match those folders.
    `(path, size, mtime)` so a rescan only rehashes what changed.
 2. Device answers `/api/status` → identity and model (X3/X4).
 3. `/api/files` is walked recursively for what's already there.
-4. `send = folders − on device`, `remove = on device − folders`, where "folders" is the union of
-   every folder bound to that reader.
+4. `send = wanted − on device`, `remove = on device − wanted`, where "wanted" is every book a folder
+   rule covers plus every book you sent to that reader by hand.
 5. Each new book is converted to EPUB (once) and optimized for the profile (once, cached as
    `opt-<hash>.epub`), then uploaded over WebSocket in ≤2048-byte frames.
 
@@ -101,10 +118,13 @@ Details worth knowing:
 - **Device filenames are readable** — `Title - Author.epub`. The source MD5 is stamped into the
   delivered EPUB's OPF metadata, so a file found on a reader can still be matched to a book.
 - **Only files Pocket Sync put there are ever deleted** — side-loaded books survive.
+- **A book leaves when nothing puts it there any more** — no send, no rule covering it. Deleting a
+  book's file un-sends it too: there is nothing left to send.
 - **Bulk deletions ask first.** Removing more than five books in one sync pauses for confirmation,
-  and a folder that is missing or unreadable aborts the sync entirely rather than being read as
-  "zero books" — including when only one of several bound folders is away. An unplugged drive can't
-  wipe your reader.
+  and dropping a folder rule that would clear that many refuses until you confirm. Un-sending never
+  asks — you pointed at the book and said so. A folder that is missing or unreadable aborts the sync
+  entirely rather than being read as "zero books", including when only one of several is away, so an
+  unplugged drive can't wipe your reader.
 - **Device identity** comes from a stable field in `/api/status` (`uuid`, `serial`, …) so DHCP can
   move the reader freely. If the firmware exposes nothing stable, the device is bound by address and
   the UI says so; rename it and it stays put as long as there's only one reader of that model.

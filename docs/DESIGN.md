@@ -1,8 +1,7 @@
 # Pocket Sync — design
 
-> **Status: agreed, not yet implemented.** This describes the target model. The code currently
-> implements the older model shown under [What this reverses](#what-this-reverses). `README.md`
-> documents present behaviour; the two will diverge until the roadmap below is complete.
+> **Status: implemented.** Phases 1–6 below are done; `README.md` documents the same behaviour from
+> the user's side.
 
 ## Why
 
@@ -13,23 +12,41 @@ human-readable; and nothing in the app knows whether a book has been read.
 
 The target is a sentence a person can hold in their head:
 
-> **This folder is on my reader.**
+> **These books are on my reader — some because I said so, some because a folder rule puts them
+> there.**
 
 Everything below follows from that, plus reading progress flowing back from the device.
+
+That sentence was once "this folder is on my reader", and the difference matters. A folder was the
+only unit of delivery, which made the folder the thing you operated and the book something you could
+only reach by filing it somewhere. But the unit of action for a person is one book: you take one off
+the shelf and put it in your bag, and only once you notice you keep taking all of one shelf do you
+make a rule. **Sending one book is the primitive; a folder rule is the automation of it.** Both put
+a book in a reader's desired set and differ only in provenance.
+
+The asymmetry that forced this was already in the code: the OPDS catalog has always served _any_
+single book from _any_ watched folder to a reader, so per-book delivery existed on the pull side and
+not the push side.
 
 ## The model
 
 1. **The filesystem is the source of truth.** A user-chosen folder _is_ a library. SQLite is a
    rebuildable index and a UI affordance — never authoritative.
 2. **Identity is the MD5 of file contents.** Survives renames and moves; deduplicates copies.
-3. **Folders and devices are many-to-many.** A device syncs any number of folders (its desired set
-   is their union, deduplicated); a folder feeds any number of devices.
+3. **Folders and devices are many-to-many.** A device carries any number of folder rules; a folder
+   feeds any number of devices. Its desired set is their union with its sends, deduplicated (5).
 4. **A user is a name, not an account.** There is no login. Each device records which user is
    currently holding it, and that is switchable — reading progress and page-sync credentials key on
    the user, so one person reading a book that sits in two of their folders has one position, while
    two people with a copy of the same file stay independent.
-5. **Everything in a folder goes to the devices bound to it.** No per-book membership, no lists.
-6. **A file removed from the folder is removed from the device**, subject to the deletion rails.
+5. **A book reaches a reader two ways: you send it, or a folder rule covers it.** A send is one row
+   in `device_pin` naming one reader and one book; a rule is `LibraryConfig.deviceIds`, meaning
+   "everything in this folder, always". The desired set is their union, and everything downstream
+   treats them identically. Still no lists, and no per-book membership _model_ — a send is a
+   decision made later about one book and one reader, not a property attached at import.
+6. **A book leaves the reader when nothing puts it there any more** — no send, no rule covering it —
+   subject to the deletion rails. That is the same reconciliation as before, stated in the terms the
+   user now has.
 7. **Resampling defaults to the device's model.** Sending an unoptimized book to a reader with ~380
    KB of layout RAM is the likeliest way to crash it, so "none" is a deliberate choice.
 8. **Device filenames are human friendly** — `Piranesi - Susanna Clarke.epub` — because with an
@@ -41,24 +58,36 @@ Everything below follows from that, plus reading progress flowing back from the 
 
 ## What this reverses
 
-| Current code                              | Target                                                |
-| ----------------------------------------- | ----------------------------------------------------- |
-| Upload button is the only way in          | Watched folder is primary; upload writes into it      |
-| `bookId` = `newId()` (ULID-ish)           | `bookId` = MD5 of file contents                       |
-| App owns `library/<id>/original.<ext>`    | App indexes the user's file in place                  |
-| Device filename `<bookId>__<title>.epub`  | `Title - Author.epub`, source MD5 embedded in the OPF |
-| `sync_rule.source_type` = library \| list | Removed — the bound folder is the source              |
-| `mode` = `add_new` \| `mirror`            | Removed — always reconcile                            |
-| Lists drive what syncs                    | Lists gone from sync entirely                         |
-| Reading state unknown                     | kosync server; `finished` is an observed tag          |
+| Original code                             | Now                                                    |
+| ----------------------------------------- | ------------------------------------------------------ |
+| Upload button is the only way in          | Watched folder is primary; upload writes into it       |
+| `bookId` = `newId()` (ULID-ish)           | `bookId` = MD5 of file contents                        |
+| App owns `library/<id>/original.<ext>`    | App indexes the user's file in place                   |
+| Device filename `<bookId>__<title>.epub`  | `Title - Author.epub`, source MD5 embedded in the OPF  |
+| `sync_rule.source_type` = library \| list | Removed — a rule or a send is the source               |
+| `mode` = `add_new` \| `mirror`            | Removed — always reconcile                             |
+| Lists drive what syncs                    | Lists gone from sync entirely                          |
+| Reading state unknown                     | kosync server; `finished` is an observed tag           |
+| A folder is the only unit of delivery     | Sending one book is the primitive; a rule automates it |
+| Every scope shows the whole library       | A scope resolves to its own contents                   |
 
-Two ideas considered and deliberately dropped, recorded so they aren't revived by accident:
+Ideas considered and deliberately dropped, recorded so they aren't revived by accident:
 
-- **Per-device checkboxes at import time.** Moot once there is no membership model — a book's
-  destination is decided by which folder it lands in.
+- **Per-device checkboxes at import time.** Still rejected, and not what sends are: a send is a
+  decision made later about one book and one reader, taken while looking at the shelf. Deciding a
+  book's destinations at the moment it is imported is a membership model applied to a file nobody
+  has looked at yet, and it is the thing that turns back into lists.
 - **The device as a write-only archive with one-shot delivery.** Attractive (the device has ample
   storage, and read books are worth keeping for reference), but incompatible with "the filesystem is
-  the source of truth." Sync is reconciliation.
+  the source of truth." Sync is reconciliation — which is also why a send has to be state rather
+  than a fire-and-forget upload: the next reconciliation would delete anything not in the desired
+  set.
+- **A reader menu on every book cover.** The destination is a decision that changes about once a
+  week, so asking per card is asking hundreds of times; and it needs a positioned popover the
+  component set does not have. The target lives once, in the toolbar, which also gives the dot on
+  every cover a single meaning.
+- **Garbage-collecting a send once a rule covers the same book.** A send is a statement the user
+  made. Dropping it silently would be a delayed surprise the day they remove the rule.
 
 Also rejected: **rewriting the app in Python.** It would lose single-host cross-compilation to five
 targets (`scripts/package.ts`), and DeDRM runs inside Calibre's own interpreter regardless of our
@@ -253,16 +282,47 @@ file → md5 → detect DRM → [calibredb add → scratch library] → EPUB →
   and missing metadata. Covers matter far more once the UI is a shelf rather than a table.
 - Each stage persists to an `import_job` row, so a blocked import survives a window close.
 
-### Sync as folder reconciliation
+### Sync as reconciliation
 
 `idsForSource()` in `src/library/books.ts` and the entire `source_type`/`mode` branch in
 `src/sync/engine.ts` go away.
 
 ```
-desired = md5 set of the bound library
+desired = md5 set of every folder rule  ∪  books sent to this reader by hand
 present = device manifest, reconciled against /api/files
 send    = desired − present          remove = present − desired
 ```
+
+`Books.idsForDevice(libraryIds, pinnedIds)` is that union, as **one** title-ordered query rather
+than two lists concatenated: the send loop reports `index of total` against this order, and
+`devicePlacements()` breaks name collisions across the whole set at once, so the outcome must not
+depend on which half a book arrived in.
+
+- **A send dies with its file.** `idsForDevice` requires a `library_book` row to survive, so a send
+  naming a book no folder holds any more drops out of the desired set on the _next sync_ rather than
+  the next restart; `reconcile()` then clears the row itself. A send is an instruction about a file,
+  and there is no file. (`reading_state` deliberately survives instead — it preserves something you
+  did on the reader, which is a different kind of thing.)
+- **Un-sending is a removal**, because reconciliation is the only removal mechanism there is. A send
+  that could be dropped without the book leaving would be a lie. It follows that un-sending a book a
+  folder rule still covers does nothing visible, which is why the UI renders that case as a state
+  rather than a control.
+- **A sent book from a folder no rule covers still mirrors that folder.** `placementsFor()` builds
+  its folder-name lookup from _every_ configured folder and only _prefers_ the ruled ones when a
+  book sits in several, so the placement is the same whether a rule covers the folder or not.
+  Otherwise the book would land at the upload root — where every folder name lives and collisions
+  are likeliest — and adding the rule later would relocate it, which on this firmware means
+  send-then-delete for every book already up there.
+- **Confirmation attaches to the ambiguous action.** Un-sending never asks: the user pointed at that
+  book and said take it off, and the routes pass `confirmRemovals` for exactly that reason. Dropping
+  a _rule_ is one click that can clear a hundred books off a reader that is not even awake, so
+  `PUT /api/libraries/:id` computes the loss before writing anything and answers
+  `409
+  confirm_removals` past `REMOVAL_CONFIRM_THRESHOLD`.
+- **A rule acts immediately.** Both the send routes and `PUT /api/libraries/:id` fire a sync without
+  awaiting it. A reader that is already awake never fires `onDeviceConnected` again, so without this
+  a rule appears to do nothing until the reader happens to reconnect. The single-flight guard
+  collapses a burst of edits into one run plus at most one rerun.
 
 - **Delivered filename** is `Title - Author.epub` via the existing `sanitizeForFilename()` in
   `src/core/ids.ts`, which already handles the firmware's FAT-ish charset, with a deterministic
@@ -391,44 +451,60 @@ that order, in one rail. There is no Devices tab; a reader is a page inside the 
 what you want to know about a reader is which books are on it.
 
 ```
-┌──────────────┬────────────────────────────────────────┐
-│ Library  142 │  [search…]                    [Select] │
-│              │                                        │
-│ Stu          │  ▾ Fiction · 82          ☑ syncs here  │
-│   X4    ●    │    ▪ ▪ ▪ ▪ ▪ ▪ ▪ ▪ ▪ ▪ ▪ ▪ ▪ ▪ ▪ ▪ ▪   │
-│   X3    ○ 3↑ │    ▪ ▪ ▪ ▪ ▪ ▪ ▪ ▪ ▪ ▪ ▪               │
-│ Sarah        │                                        │
-│   X3-b  ●    │  ▸ Comics · 14           ☐ syncs here  │
-│ ──────────   │                                        │
-│ All          │  ▾ Reference · 0                       │
-│ Reading      │    Nothing here yet — drop books onto  │
-│ Unread       │    this folder to add.                 │
-│ Finished     │                                        │
-└──────────────┴────────────────────────────────────────┘
+┌──────────────┬──────────────────────────────────────────────────────┐
+│ Library  142 │ [search…] │Sending to [Stu's X4 ▾]│ Group by [Folder ▾]│
+│              │                                                      │
+│ Stu          │  ▾ Fiction · 82   → Stu's X4                         │
+│   X4    ●    │    ▪ ▪ ▪ ▪ ▪ ▪ ▪ ▪ ▪ ▪ ▪ ▪ ▪ ▪ ▪ ▪ ▪                 │
+│   X3    ○ 3↑ │    ▪ ▪ ▪ ▪ ▪ ▪ ▪ ▪ ▪ ▪ ▪         each cover carries  │
+│ Sarah        │                                  a ＋ / ✓ on hover   │
+│   X3-b  ●    │  ▸ Comics · 14                                       │
+│ ──────────   │                                                      │
+│ + Add books  │  ▾ Reference · 0                                     │
+│ + Add person │    Nothing here yet — drop books onto this folder.   │
+│ ──────────   │                                                      │
+│ All          │                                                      │
+│ Reading      │                                                      │
+│ Unread       │                                                      │
+│ Finished     │                                                      │
+└──────────────┴──────────────────────────────────────────────────────┘
 ```
 
-- **One shelf, three scopes.** `Shelf.tsx` renders every watched folder as a collapsible section of
-  ~100px covers, and the whole library, a person and a reader all use it. What changes is only
-  whether folders carry a binding checkbox. Covers are small deliberately: the shelf is for finding
-  a book among hundreds, not admiring one.
-- **Empty folders still get a header.** A folder you have just ticked in Settings must not look like
+- **Every scope resolves to its own contents.** `resolveScope()` in `src/library/shelf.ts` turns
+  `all | user:<id> | device:<id>` into folders, extra book ids and a progress owner, which
+  `/api/library` then answers with. A reader's page is what that reader carries — its rules, its
+  sends, and its `device_content`, so books whose rule was dropped or whose file has left the
+  library are still visible. A person's page is their readers' books plus the pile they are part-way
+  through, which is what gives the page meaning when they hold no reader at all. This replaces a
+  scope switch that changed only which checkbox sat on each folder header; the binding lives in
+  `config.json` rather than SQLite, which is why this is a resolver and not a join.
+- **One reader is the send target, chosen once, in the toolbar.** Every cover then carries a single
+  unambiguous button, and the dot on the cover means "on _that_ reader" rather than "on some reader
+  this scope is vaguely about". Looking at a reader's page makes it the target automatically.
+- **Provenance is legible on the card.** Four states: absent (`＋`), sent by hand (`✓`, clicking
+  un-sends), there by a folder rule (`✓` muted, no action, the rule named in the tooltip), and
+  queued. Collapsing the middle two would put an un-send on a book the rule would immediately put
+  back, which teaches people not to trust the control.
+- **Folders are one grouping, not the only one.** `grouping.ts` also groups by author, series (in
+  `series_index` order, with one trailing `Standalone` section rather than a hundred one-book ones)
+  and recency. It is preact-free so `tests/unit_test.ts` can cover it, and client-side because the
+  whole shelf already arrives in one request.
+- **Empty folders still get a header.** A folder you have just started watching must not look like
   it failed. While a search or reading filter is active, groups with matches force themselves open
-  and empty ones drop out, so a match can never hide behind a collapsed caret. Collapse choices
-  persist in `localStorage`; the default is open, except a folder that doesn't sync to the reader
-  you are looking at.
+  and empty ones drop out, so a match can never hide behind a collapsed caret.
 - **A book in two folders appears under both.** That is what `library_book` says and what
   `/api/library` has always returned; grouping is what finally makes it read as one book in two
   places rather than a duplicate.
-- **Books land in a folder, so folders are the drop target.** The section under the cursor takes the
-  drop and uploads there — there is no "current folder" to guess at.
-- **Per-user folder selection is a bulk edit, not a binding.** The binding stays per device
-  (`LibraryConfig.deviceIds`, invariant 5): ticking a folder on a person's page adds every reader
-  they currently hold, and the box shows half-ticked when only some of them have it. A reader
-  assigned to them later inherits nothing, and a person holding no reader has the toggle disabled
-  with the reason — there is nothing for the tick to write to. The alternative, a real `userIds`
-  binding fanned out through `device_settings.user_id`, was rejected: that field means "who is
-  holding this reader" and is meant to be switched freely, which would make handing someone your X3
-  silently rewrite what is on it.
+- **Books land in a folder, so folders are the drop target** — when the shelf is grouped by folder.
+  Under any other grouping there is no folder under the cursor and guessing is not acceptable, so a
+  permanent strip above the shelf names the destination. Permanent, not revealed on dragenter: a
+  hidden drop target is how a drop goes nowhere.
+- **Folder rules are set on the reader, in one line** (`Always send: Comics · Fiction · Change`),
+  not as a checkbox on every folder in every scope. This deletes the tri-state `Bound` type and
+  `targetsFor()`, and with them the "per-user folder selection is a bulk edit, not a binding" hybrid
+  that this document previously recorded as uncomfortable: a person's page no longer edits bindings
+  at all. A rule belongs to a reader, and `device_settings.user_id` is meant to be switched freely,
+  so fanning rules out through it would make handing someone your X3 silently rewrite what is on it.
 
 - **Activity** (`Activity.tsx`) is the one place for "what is the app doing": the Inbox of imports
   on top, the running log below. The Inbox itself (`Inbox.tsx`) is server-backed and streamed over
@@ -444,38 +520,60 @@ what you want to know about a reader is which books are on it.
   of the one in flight, and it never falls back mid-run. Imports are indeterminate on purpose — the
   scanner discovers files as it walks, so any denominator would grow underneath the bar and make it
   retreat, which is exactly what inferring the total from "books seen so far" did.
-- **Library** (`Library.tsx`): the rail and the scope switch; the shelf itself is `Shelf.tsx`.
-  Reading progress as a bar across the cover, selection behind a `Select` mode instead of a
-  permanent checkbox on every card, and the dropzone revealed per folder on dragenter
-  (`useGlobalDropGuard` swallows document-level drops).
-- **A book's whereabouts is one dot**, top-left of the cover: green on the reader, orange on its way
-  (pulsing while actually uploading), grey not set to sync anywhere. Which readers "on the reader"
-  means follows the scope — this reader, this person's, or every reader the folder feeds. Naming
-  them on each card was noise at 100px, and a bare count said nothing.
-- **Person** (`UserView.tsx`): their readers, their page-sync credentials, and the folder ticks that
-  fan out across every reader they hold.
-- **Reader** (`DeviceView.tsx`): the folder ticks, and below them **Also on this reader** — only the
-  files no folder accounts for (side-loaded books, and books whose file has left the folder).
-  Everything a folder does account for is already on screen as covers, so the old four-column table
-  of the whole device restated it. These are the files a sync deliberately never touches, so being
-  visible is the whole point. **There is no Sync now button** — syncing is automatic, and a button
-  implying otherwise makes the reader look like something you operate. The state that used to be
-  printed under the name (address, last seen, identity, how many are waiting) is a tooltip on the
-  online/offline pill. Name, holder, resampling and the two switches are behind **Edit**, saved
-  live; a manual sync sits there too, for someone who has turned automatic syncing off.
+- **Library** (`Library.tsx`): the rail, the toolbar (search, send target, grouping, `Select`) and
+  the scope switch; the shelf itself is `Shelf.tsx`, now a pure presenter taking groups and a
+  target. Reading progress is a bar across the cover, selection sits behind a `Select` mode instead
+  of a permanent checkbox on every card, and `useGlobalDropGuard` swallows document-level drops.
+  `Select` mode offers **Send N to <reader>** as well as Delete — one request and one sync, which is
+  how you pack for a trip.
+- **A book's whereabouts is one dot**, top-left of the cover: green on the target reader, orange on
+  its way (pulsing while actually uploading), grey not there. Naming readers on each card was noise
+  at 100px, and a bare count said nothing.
+- **Person** (`UserView.tsx`): their name, their readers, their page-sync credentials, and their
+  books. No folder controls at all.
+- **Reader** (`DeviceView.tsx`): the reader's own books, with **Held by** and the rules line on the
+  header — the two things that actually change — and below the shelf **Also on this reader**, now
+  only genuinely side-loaded files. Books we sent whose file has left the library appear in the
+  shelf's own `Not in a watched folder` group instead, which is what finally makes "sync leaves
+  these alone" a true statement about the section.
+  - The old **Edit** dialog is gone. It carried seven unrelated concerns behind a button whose only
+    affirmative action was _Close_, and it hid the one field that makes a reader useful. The
+    switches, a manual sync, the resample profile, the sync-server override and **Forget** are in an
+    `<details class="advanced">`; name and holder are on the header.
+  - **Page sync and the catalog have no buttons while they are working.** Both are pushed on every
+    connect, so a permanent button implies work the user does not have to do. They appear only when
+    a push has not taken — and then _outside_ the disclosure, because a warning that hides inside a
+    collapsed accordion is not a warning.
+  - The connection state (address, last seen, identity, counts) is a tooltip on the online/offline
+    pill.
+- **A reader the app has just met** (`NewReaders.tsx`) raises a card at the top of the library: its
+  model, a name, and "who is holding it", with one **Set up** button that also makes it the send
+  target and takes you to its page. `device_settings.setup_at` records that it has been offered, and
+  means "the user has looked at this reader once" rather than "configured" — everything that needs
+  configuring is automatic. A card and not a modal: this is raised by a discovery event, and a modal
+  that appears because something happened on the network is an ambush.
 - **The one thing automation cannot decide** is a bulk deletion: past `REMOVAL_CONFIRM_THRESHOLD` a
-  sync stops and changes nothing, so with no Sync button the removals would wait forever.
-  `plan.needsConfirm` (computed in `SyncEngine.plan()`, beside the threshold it uses) raises a
-  banner on the reader's page; confirming runs the unconfirmed sync first so the warning can name
-  the actual titles.
+  sync stops and changes nothing, so the removals would otherwise wait forever. `plan.needsConfirm`
+  (computed in `SyncEngine.plan()`, beside the threshold it uses) raises a banner on the reader's
+  page; confirming runs the unconfirmed sync first so the warning can name the actual titles.
+  Dropping a folder rule is gated the same way, on the route.
+- **Getting books in is a library action, not a setting.** `AddBooks.tsx` (the root picker, the
+  folder navigator, and existing e-reader libraries) and `People.tsx` open from `+ Add books` and
+  `+ Add person` in the rail. Settings previously owned the single most important control in the app
+  and filed it next to the log level.
+- **Settings is what is left**: five or six real switches, with 20-odd transport knobs — socket
+  timeouts, retry delays, auto-probed executable paths — behind `<details class="advanced">`. Kept
+  working rather than deleted: they are the levers for a reader that misbehaves on one network.
 - **Discovery** (`Discovery.tsx`, in Settings): the network side only — whether the app is looking,
   whether anything has ever answered, and the readers it knows about. The three states that look
   identical from a bare "no devices yet" (discovery off, nothing configured to probe, probing but
   silent) each say which one they are.
-- **Drawer** (`BookDrawer.tsx`): progress and its freshness, a manual finished toggle, fix metadata
-  / fetch cover, the source file path, re-send.
+- **Drawer** (`BookDrawer.tsx`): progress and its freshness, a manual finished toggle, the source
+  file path, and **On which readers** — a row per reader, which is the complete view where the
+  card's button covers only the toolbar's target. A rule-covered row is locked with its reason.
 - **Removed**: the Lists tab, `Lists.tsx`, `src/library/lists.ts`, the `list` / `list_item` tables,
-  and the Devices tab.
+  the Devices tab, the tri-state `Bound` type, `Shelf`'s `binding` prop, `targetsFor()`, and the
+  client-side `scopeUserId()` / `reloadBooksIfUserChanged()` race the server now settles.
 
 ## Schema
 
@@ -490,6 +588,11 @@ One appended migration in `src/core/db.ts`; the existing v1 array is never edite
 - `kosync_document (document_hash, book_id, profile_hash)`.
 - `sync_rule` → `device_settings`: drops `source_type`, `source_list_id`, `mode`; adds `library_id`.
 - Drops `list`, `list_item`.
+- `device_pin (device_id, book_id, created_at)` — books sent to one reader by hand. No `library_id`:
+  where a sent book is filed is derived from `library_book` at send time, exactly as a rule-covered
+  book's is, so the two can never disagree after a rename. Both foreign keys cascade, so forgetting
+  a reader drops its sends and purging a book drops the sends naming it.
+- `device_settings.setup_at` — whether the "new reader" card has been offered.
 
 Because ids change representation, migration **re-derives** rather than converting: keep
 `device_content` rows, re-hash on the first scan, and match existing on-device files against the old
@@ -497,30 +600,38 @@ Because ids change representation, migration **re-derives** rather than converti
 
 ## Roadmap
 
-| # | Scope                                                                  | Done when                                                     |
-| - | ---------------------------------------------------------------------- | ------------------------------------------------------------- |
-| 0 | This document                                                          | Decisions recorded in-repo                                    |
-| 1 | Watched folders, MD5 identity, scanner, hash cache, schema v2          | A folder populates the library; rename/move doesn't duplicate |
-| 2 | Sync reconciliation, human filenames, embedded MD5, deletion rails     | `acceptance.sh` green, delete-on-disappear covered            |
-| 3 | Inbox and the library/device/drawer UI                                 | Imports block visibly and resume; no Lists tab                |
-| 4 | Staged Calibre pipeline, DRM detection, plugin install, metadata fetch | A DRM'd file reports accurately and unlocks after a key       |
-| 5 | kosync listener, document mapping, finished tag                        | A real X4 reports progress; a book shows as finished          |
+| # | Scope                                                                  | Done when                                                                                       |
+| - | ---------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| 0 | This document                                                          | Decisions recorded in-repo                                                                      |
+| 1 | Watched folders, MD5 identity, scanner, hash cache, schema v2          | A folder populates the library; rename/move doesn't duplicate                                   |
+| 2 | Sync reconciliation, human filenames, embedded MD5, deletion rails     | `acceptance.sh` green, delete-on-disappear covered                                              |
+| 3 | Inbox and the library/device/drawer UI                                 | Imports block visibly and resume; no Lists tab                                                  |
+| 4 | Staged Calibre pipeline, DRM detection, plugin install, metadata fetch | A DRM'd file reports accurately and unlocks after a key                                         |
+| 5 | kosync listener, document mapping, finished tag                        | A real X4 reports progress; a book shows as finished                                            |
+| 6 | Sends, scoped shelves, grouped browsing, reader setup, Settings shrink | A book reaches a reader with no folder rule, and a new reader is usable without opening a modal |
 
-Phases 1–2 change data on disk; 3–5 are additive.
+Phases 1–2 change data on disk; 3–6 are additive.
 
 ## Verification
 
-- `deno task check` and `deno task test` throughout. `tests/unit_test.ts` gains cases for MD5
-  identity stability across rename and move, filename collision tiebreak, and settle detection.
-- `deno task acceptance` must stay green against `tests/fake_device.ts`, with new steps: a file
-  removed from the folder is removed from the device; the threshold confirm blocks a bulk delete; an
-  unreadable root aborts without deleting anything. The existing `--fail-upload` and `--drop-upload`
-  interruption cases must keep passing.
+- `deno task check` and `deno task test` throughout. `tests/unit_test.ts` covers MD5 identity
+  stability across rename and move, the filename collision tiebreak, settle detection, that a
+  hand-sent book is filed under its own folder without disturbing the rule-covered ones, and the
+  shelf's four groupings.
+- `deno task acceptance` must stay green against `tests/fake_device.ts`: a file removed from the
+  folder is removed from the device; the threshold confirm blocks a bulk delete; an unreadable root
+  aborts without deleting anything; and for sends — a book with no folder rule reaches the reader
+  and is filed under its own folder, adding the rule afterwards moves nothing, un-sending a
+  rule-covered book leaves it alone, losing both takes it off, and deleting the source file takes it
+  off. The existing `--fail-upload` and `--drop-upload` interruption cases must keep passing.
 - kosync gets a fake client posting a known payload, asserting the document maps to the right book
   and flips `finished` at 99%.
 - On real hardware: confirm the firmware's filename length and charset limits with a long unicode
-  title **before phase 2 locks the naming scheme**, and confirm the actual kosync document hash
-  method from the first live request in phase 5.
+  title, and confirm the actual kosync document hash method from the first live request.
+
+> **Running the app by hand:** stop the desktop app first. Its UDP discovery answers anything on the
+> LAN, `tests/fake_device.ts` binds loopback, and the two find each other — a real library gets
+> synced to a scratch directory and a phantom reader is left in the real database.
 
 ## Out of scope
 

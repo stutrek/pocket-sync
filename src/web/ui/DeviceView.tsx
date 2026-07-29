@@ -1,19 +1,27 @@
-// One reader: what it holds and the folders that feed it. Syncing is automatic,
-// so there is no button for it — the page is about what the reader carries, and
-// everything you might change about the reader itself is behind Edit.
+// One reader: what it is carrying, and why.
+//
+// The page used to show the whole library with a checkbox on every folder
+// header, and hide everything you might actually change behind a dialog called
+// Edit whose only affirmative button was Close. Now the shelf is *this reader's*
+// books, the two things that change often (who is holding it, which folders feed
+// it) are on the header, and the rest is behind a disclosure — except a warning,
+// which must never be.
 import { useEffect, useState } from "preact/hooks";
 import { api, errText, fmtBytes, fmtDate } from "./api.ts";
 import { Check, Modal, Select, Tooltip } from "./components.tsx";
+import { groupsFor } from "./grouping.ts";
 import { Shelf } from "./Shelf.tsx";
-import type { Bound } from "./Shelf.tsx";
 import {
+  books,
   devices,
+  groupBy,
   libraries,
   loadBooks,
   loadDevices,
   loadLibraries,
   loadUsers,
   profiles,
+  send,
   toast,
   users,
 } from "./store.ts";
@@ -24,26 +32,24 @@ export function DeviceView({ id }: { id: string }) {
 
   useEffect(() => {
     loadUsers();
+    loadLibraries();
   }, []);
 
   if (!d) return <p class="empty">This reader is no longer listed.</p>;
 
-  const state = (folder: Library): Bound => folder.deviceIds.includes(d.id) ? "on" : "off";
-
-  /** Folders are many-to-many, so toggling one leaves the others alone. */
-  const toggle = async (folder: Library, on: boolean) => {
-    const deviceIds = on
-      ? [...new Set([...folder.deviceIds, d.id])]
-      : folder.deviceIds.filter((x) => x !== d.id);
-    try {
-      await api("PUT", `/api/libraries/${folder.id}`, { deviceIds });
-      await Promise.all([loadLibraries(), loadDevices()]);
-    } catch (err) {
-      toast(errText(err), "error");
-    }
-  };
-
   const name = d.name || d.model || "this reader";
+  // Folders with a rule keep their header even when empty — a rule you just
+  // added must not look like it failed. Folders with no rule appear only if this
+  // reader is actually carrying something out of them, which is what a book sent
+  // by hand out of an unruled folder looks like.
+  const present = new Set(books.value.map((b) => b.library_id));
+  const folders = libraries.value.filter((l) => d.libraryIds.includes(l.id) || present.has(l.id));
+  const groups = groupsFor(
+    books.value,
+    folders,
+    groupBy.value,
+    (folder) => d.libraryIds.includes(folder.id) ? "folder rule" : "sent by hand",
+  );
 
   return (
     <div class="scope-view">
@@ -51,8 +57,15 @@ export function DeviceView({ id }: { id: string }) {
       <PendingRemovals device={d} />
 
       <Shelf
-        folders={libraries.value}
-        binding={{ state, toggle, label: `Sync to ${name}` }}
+        groups={groups}
+        target={d.id}
+        empty={
+          <p class="empty">
+            Nothing on {name} yet. Open <strong>Library</strong> and press{" "}
+            <span class="send-mark">＋</span>{" "}
+            on a book to send it — or add a folder rule above to keep a whole folder in step.
+          </p>
+        }
       />
 
       <Strays device={d} />
@@ -61,19 +74,28 @@ export function DeviceView({ id }: { id: string }) {
 }
 
 function DeviceHeader({ device: d }: { device: Device }) {
-  const [editing, setEditing] = useState(false);
-
+  const [renaming, setRenaming] = useState(false);
+  const [name, setName] = useState(d.name ?? "");
   const holder = users.value.find((u) => u.id === d.settings.user_id);
+  const profile = profiles.value.find((p) => p.id === d.settings.profile_id);
+
+  const patch = async (body: Record<string, unknown>) => {
+    await api("PUT", `/api/devices/${d.id}/settings`, body);
+    // Who holds a reader decides whose progress the shelf shows, so the books
+    // have to catch up too.
+    await Promise.all([loadDevices(), loadUsers()]);
+    loadBooks();
+  };
 
   // Everything about the connection in one hover, rather than a line of small
-  // print under the name that is only interesting when something is wrong.
+  // print that is only interesting when something is wrong.
   const detail: [string, string | null][] = [
     ["Address", d.state.host || d.last_ip || "unknown"],
     ["Last seen", fmtDate(d.last_seen)],
     ["Identified by", d.id_strategy === "ip" ? "network address" : d.id_strategy],
     ["On device", `${d.plan.onDevice} book(s)`],
+    ["Sent by hand", d.plan.sent ? `${d.plan.sent} book(s)` : "none"],
     ["Waiting to send", d.plan.send ? `${d.plan.send} book(s)` : "nothing"],
-    ["To remove", d.plan.remove ? `${d.plan.remove} book(s)` : null],
     ["Last sync", d.state.lastSyncResult ?? null],
   ];
 
@@ -81,106 +103,286 @@ function DeviceHeader({ device: d }: { device: Device }) {
     <>
       <header class="scope-head">
         <span class={`dot${d.state.online ? " ok" : ""}`} />
-        <h2>{d.name || d.model || d.id}</h2>
+        {renaming
+          ? (
+            <input
+              value={name}
+              autoFocus
+              onInput={(e) => setName(e.currentTarget.value)}
+              onBlur={async () => {
+                setRenaming(false);
+                if (name !== (d.name ?? "")) {
+                  await api("PATCH", `/api/devices/${d.id}`, { name });
+                  loadDevices();
+                }
+              }}
+              onKeyDown={(e) => e.key === "Enter" && e.currentTarget.blur()}
+            />
+          )
+          : (
+            <h2 onClick={() => setRenaming(true)} title="Click to rename">
+              {d.name || d.model || d.id}
+            </h2>
+          )}
         <Tooltip rows={detail}>
           <span class={`badge ${d.state.online ? "online" : "offline"} has-detail`}>
             {d.state.syncing ? "syncing…" : d.state.online ? "online" : "offline"}
           </span>
         </Tooltip>
-        {d.model && <span class="badge">{d.model}</span>}
-        {/* Edit hides the switch, so the state has to show here. */}
         {!d.settings.enabled && <span class="badge warn-badge">paused</span>}
-        {holder && <span class="muted small">{holder.name}</span>}
         <span class="spacer" />
-        <button type="button" onClick={() => setEditing(true)}>Edit</button>
-      </header>
-
-      {editing && <EditDialog device={d} onClose={() => setEditing(false)} />}
-    </>
-  );
-}
-
-/**
- * Everything about the reader itself. Settings save on change — there is no
- * Save button to forget to press — so closing the dialog cannot lose an edit.
- */
-function EditDialog({ device: d, onClose }: { device: Device; onClose: () => void }) {
-  const [name, setName] = useState(d.name ?? "");
-  const [syncing, setSyncing] = useState(false);
-
-  const patchSettings = async (patch: Record<string, unknown>) => {
-    await api("PUT", `/api/devices/${d.id}/settings`, patch);
-    // Who holds a reader decides where it sits in the rail and whose progress
-    // the shelf shows, so both lists have to catch up before the next paint.
-    await Promise.all([loadDevices(), loadUsers()]);
-    loadBooks();
-  };
-
-  return (
-    <Modal title={d.name || d.model || d.id} onClose={onClose}>
-      <div class="form">
-        <label>Name</label>
-        <div class="rule">
-          <input value={name} onInput={(e) => setName(e.currentTarget.value)} />
-          <button
-            type="button"
-            disabled={name === (d.name ?? "")}
-            onClick={async () => {
-              await api("PATCH", `/api/devices/${d.id}`, { name });
-              loadDevices();
-              toast("Renamed", "ok");
-            }}
-          >
-            Save
-          </button>
-        </div>
-
-        <label>Held by</label>
+        {/* The one field that makes a reader useful. Never behind anything. */}
+        <span class="muted small">Held by</span>
         <Select
           value={d.settings.user_id ?? ""}
           options={[
             ["", "— nobody —"],
             ...users.value.map((u): [string, string] => [u.id, u.name]),
           ]}
-          onChange={(v) => patchSettings({ user_id: v || null })}
+          onChange={(v) => patch({ user_id: v || null })}
         />
+      </header>
 
-        <label>Resampling</label>
+      <div class="scope-facts">
+        <span>{`On it: ${d.plan.onDevice} book${d.plan.onDevice === 1 ? "" : "s"}`}</span>
+        <Rules device={d} />
+        <span class="muted small">
+          {`Resampling: ${profile ? profile.name : "none"}`}
+        </span>
+      </div>
+
+      {/* A reader nobody holds cannot be given page-sync credentials at all. */}
+      {!holder && (
+        <p class="muted small">
+          Nobody is holding this reader, so it is not set up for page sync — the only credentials it
+          could be given would be somebody else's.
+        </p>
+      )}
+
+      <Unsettled device={d} />
+      <Advanced device={d} />
+    </>
+  );
+}
+
+/**
+ * Folder rules: "everything in Comics, always".
+ *
+ * Sending one book is the primitive and a rule is the automation of it, so this
+ * is a short statement with a way to change it rather than a checkbox on every
+ * folder in the library. Removing a rule can clear a hundred books off a reader
+ * that is not even awake, so past the threshold the server refuses and this
+ * asks first.
+ */
+function Rules({ device: d }: { device: Device }) {
+  const [editing, setEditing] = useState(false);
+  const ruled = libraries.value.filter((l) => d.libraryIds.includes(l.id));
+
+  const setRule = async (folder: Library, on: boolean, confirmed = false) => {
+    const deviceIds = on
+      ? [...new Set([...folder.deviceIds, d.id])]
+      : folder.deviceIds.filter((x) => x !== d.id);
+    try {
+      await api(
+        "PUT",
+        `/api/libraries/${folder.id}${confirmed ? "?confirmRemovals=1" : ""}`,
+        { deviceIds },
+      );
+      await Promise.all([loadLibraries(), loadDevices()]);
+      loadBooks();
+    } catch (err) {
+      const message = errText(err);
+      if (message === "confirm_removals") {
+        if (
+          confirm(
+            `Dropping “${folder.name}” takes its books off ${d.name || d.id}. Go ahead?`,
+          )
+        ) await setRule(folder, on, true);
+        return;
+      }
+      toast(message, "error");
+    }
+  };
+
+  return (
+    <>
+      <span>
+        {ruled.length
+          ? (
+            <>
+              Always send: <strong>{ruled.map((l) => l.name).join(" · ")}</strong>
+            </>
+          )
+          : <span class="muted">No folder rules</span>}
+      </span>
+      <button type="button" class="link" onClick={() => setEditing(true)}>
+        {ruled.length ? "Change" : "Add a rule"}
+      </button>
+
+      {editing && (
+        <Modal title="Folders that sync here" onClose={() => setEditing(false)}>
+          <p class="muted">
+            Everything in a ticked folder stays on this reader — new books arrive on their own, and
+            a file you delete comes off. Books you send by hand are separate and are not affected.
+          </p>
+          {libraries.value.length === 0
+            ? <p class="muted">No watched folders yet — add one from the sidebar.</p>
+            : libraries.value.map((folder) => (
+              <div key={folder.id} class="folder-row">
+                <div>
+                  <strong>{folder.name}</strong>
+                  <div class="muted small">{`${folder.books} book(s)`}</div>
+                </div>
+                <span class="spacer" />
+                <Check
+                  label="Always send"
+                  checked={folder.deviceIds.includes(d.id)}
+                  onChange={(v) => setRule(folder, v)}
+                />
+              </div>
+            ))}
+          <div class="modal-actions">
+            <span class="spacer" />
+            <button type="button" class="primary" onClick={() => setEditing(false)}>Done</button>
+          </div>
+        </Modal>
+      )}
+    </>
+  );
+}
+
+/**
+ * Page sync and the catalog are pushed automatically on every connect, so their
+ * buttons are noise — until one of them has not taken, which is the only time
+ * there is anything for a person to do.
+ *
+ * Deliberately outside the Advanced disclosure: a warning that hides inside a
+ * collapsed accordion is not a warning.
+ */
+function Unsettled({ device: d }: { device: Device }) {
+  const settled = (s: string | null) => s === "configured" || s === "unchanged" || s === "adopted";
+  const pageBad = !!d.settings.user_id && !settled(d.settings.kosync_state);
+  const catalogBad = !settled(d.settings.opds_state);
+  if (!pageBad && !catalogBad) return null;
+
+  return (
+    <div class="banner">
+      <div class="grow">
+        {pageBad && (
+          <div>
+            <strong>Reading progress is not set up on this reader.</strong>{" "}
+            <span class="small">{d.settings.kosync_detail ?? ""}</span>
+          </div>
+        )}
+        {catalogBad && (
+          <div>
+            <strong>This reader cannot browse the library yet.</strong>{" "}
+            <span class="small">{d.settings.opds_detail ?? ""}</span>
+          </div>
+        )}
+      </div>
+      <span class="spacer" />
+      <button
+        type="button"
+        disabled={!d.state.online}
+        onClick={async () => {
+          try {
+            if (pageBad) await api<ReaderConfig>("POST", `/api/devices/${d.id}/kosync`);
+            if (catalogBad) await api<ReaderConfig>("POST", `/api/devices/${d.id}/opds`);
+            loadDevices();
+          } catch (err) {
+            toast(errText(err), "error");
+          }
+        }}
+      >
+        {d.state.online ? "Try again" : "Reader is offline"}
+      </button>
+    </div>
+  );
+}
+
+/**
+ * The switches, the manual sync, the page-sync server override and Forget.
+ *
+ * All of these are either automatic or rare, which is exactly what a disclosure
+ * is for — the old dialog gave them the same weight as the reader's name.
+ */
+function Advanced({ device: d }: { device: Device }) {
+  const [syncing, setSyncing] = useState(false);
+  const holder = users.value.find((u) => u.id === d.settings.user_id);
+
+  const patch = async (body: Record<string, unknown>) => {
+    await api("PUT", `/api/devices/${d.id}/settings`, body);
+    loadDevices();
+  };
+
+  return (
+    <details class="advanced">
+      <summary>Advanced</summary>
+
+      <div class="rule">
+        <Check
+          label="Sync to this reader"
+          checked={!!d.settings.enabled}
+          onChange={(v) => patch({ enabled: v ? 1 : 0 })}
+        />
+        <Check
+          label="Automatically, when it wakes"
+          checked={!!d.settings.auto_on_connect}
+          onChange={(v) => patch({ auto_on_connect: v ? 1 : 0 })}
+        />
+      </div>
+
+      <div class="rule">
         <Select
           value={d.settings.profile_id ?? ""}
           options={[
-            ["", "None (send as converted)"],
-            ...profiles.value.map((p): [string, string] => [p.id, p.name]),
+            ["", "Resampling: none (send as converted)"],
+            ...profiles.value.map((p): [string, string] => [p.id, `Resampling: ${p.name}`]),
           ]}
-          onChange={(v) => patchSettings({ profile_id: v || null })}
+          onChange={(v) => patch({ profile_id: v || null })}
         />
-
-        <label>Syncing</label>
-        <div class="checks">
-          <Check
-            label="Sync to this reader"
-            checked={!!d.settings.enabled}
-            onChange={(v) => patchSettings({ enabled: v ? 1 : 0 })}
-          />
-          <Check
-            label="Automatically, when it wakes"
-            checked={!!d.settings.auto_on_connect}
-            onChange={(v) => patchSettings({ auto_on_connect: v ? 1 : 0 })}
-          />
-        </div>
-
-        <label>Reports to</label>
-        <PageSync
-          device={d}
-          onChange={(sync_server_id) => patchSettings({ sync_server_id })}
-        />
-
-        <label>Browses</label>
-        <Catalog device={d} />
       </div>
 
-      {/* In the footer these read as the dialog's OK and Cancel. Forget is not. */}
-      <div class="modal-row">
+      {/* Only worth a control once there is more than one place to report to. */}
+      {holder && holder.syncServers.length > 1 && (
+        <div class="rule">
+          <Select
+            value={d.settings.sync_server_id ?? ""}
+            options={[
+              ["", `Reports to ${holder.name}'s default`],
+              ...holder.syncServers.map((s): [string, string] => [s.id, `Reports to ${s.name}`]),
+            ]}
+            onChange={(v) => patch({ sync_server_id: v || null })}
+          />
+        </div>
+      )}
+
+      {d.plan.sent > 0 && (
+        <div class="folder-row">
+          <div>
+            <strong>{`Sent by hand · ${d.plan.sent}`}</strong>
+            <div class="muted small">
+              Books you sent to this reader directly. A folder rule covering one of them does not
+              clear it — you said to send it, so it stays until you say otherwise.
+            </div>
+          </div>
+          <span class="spacer" />
+          <button
+            type="button"
+            onClick={async () => {
+              if (!confirm(`Take all ${d.plan.sent} hand-sent books off ${d.name || d.id}?`)) {
+                return;
+              }
+              await send(d.id, d.pinnedBookIds, false);
+            }}
+          >
+            Clear them
+          </button>
+        </div>
+      )}
+
+      <div class="folder-row">
         <div>
           <strong>Sync now</strong>
           <div class="muted small">
@@ -209,7 +411,7 @@ function EditDialog({ device: d, onClose }: { device: Device; onClose: () => voi
         </button>
       </div>
 
-      <div class="modal-row">
+      <div class="folder-row">
         <div>
           <strong>Forget this reader</strong>
           <div class="muted small">
@@ -224,133 +426,12 @@ function EditDialog({ device: d, onClose }: { device: Device; onClose: () => voi
             if (!confirm("Forget this reader and its sync history?")) return;
             await api("DELETE", `/api/devices/${d.id}`);
             loadDevices();
-            onClose();
           }}
         >
           Forget
         </button>
       </div>
-
-      <div class="modal-actions">
-        <span class="spacer" />
-        <button type="button" class="primary" onClick={onClose}>Close</button>
-      </div>
-    </Modal>
-  );
-}
-
-/**
- * Where this reader reports reading progress, and whether it has been told.
- *
- * Setting this up is otherwise a URL, a username and a password typed on an
- * e-ink keyboard, so we write it to the reader on every sync. The picker is
- * an override: normally a reader follows its holder's default, which is what
- * makes handing it to somebody else move it to *their* server. Pinning it here
- * is for the reader that should stay where it is — usually one we adopted
- * because it was already pointed somewhere when we first saw it.
- */
-function PageSync(
-  { device: d, onChange }: { device: Device; onChange: (serverId: string | null) => Promise<void> },
-) {
-  const [busy, setBusy] = useState(false);
-  const { kosync_state: state, kosync_detail: detail } = d.settings;
-  const holder = users.value.find((u) => u.id === d.settings.user_id);
-
-  if (!holder) {
-    return (
-      <div class="small warn">
-        Nobody is holding this reader, so it is not set up for page sync — the only credentials it
-        could be given would be somebody else's.
-      </div>
-    );
-  }
-
-  const push = async () => {
-    setBusy(true);
-    try {
-      const r = await api<ReaderConfig>("POST", `/api/devices/${d.id}/kosync`);
-      toast(r.detail || r.state, r.state === "failed" ? "error" : "ok");
-      loadDevices();
-    } catch (err) {
-      toast(errText(err), "error");
-    }
-    setBusy(false);
-  };
-
-  const settled = state === "configured" || state === "unchanged" || state === "adopted";
-  // With one server there is nothing to choose: "follow the default" and the
-  // single server are the same destination, and offering both reads as a
-  // duplicate rather than as an override. The picker earns its place only once
-  // a second server exists.
-  const choices = holder.syncServers.length > 1;
-
-  return (
-    <div>
-      {choices && (
-        <Select
-          value={d.settings.sync_server_id ?? ""}
-          options={[
-            ["", `Follow ${holder.name}'s default`],
-            ...holder.syncServers.map((s): [string, string] => [
-              s.id,
-              s.id === holder.defaultSyncServerId ? `${s.name} (their default)` : s.name,
-            ]),
-          ]}
-          onChange={(v) => onChange(v || null)}
-        />
-      )}
-      <div class={settled ? "muted small" : "small warn"}>
-        {detail || "Not set up on this reader yet."}
-        {d.settings.kosync_at && settled && ` · ${fmtDate(d.settings.kosync_at)}`}
-      </div>
-      <button type="button" disabled={busy || !d.state.online} onClick={push}>
-        {!d.state.online
-          ? "Reader is offline"
-          : state === "adopted"
-          ? "Point it at the chosen server"
-          : settled
-          ? "Set up again"
-          : "Set up on the reader"}
-      </button>
-    </div>
-  );
-}
-
-/**
- * Whether this reader can browse the library itself.
- *
- * Shown even when the catalog is switched off, because "off in Settings" is the
- * commonest reason nothing happened and it is otherwise indistinguishable from
- * the feature not existing. Unlike page sync this needs no holder: the catalog
- * is scoped by bound folder and resample profile, neither of which is personal.
- */
-function Catalog({ device: d }: { device: Device }) {
-  const [busy, setBusy] = useState(false);
-  const { opds_state: state, opds_detail: detail } = d.settings;
-  const settled = state === "configured" || state === "unchanged";
-
-  const push = async () => {
-    setBusy(true);
-    try {
-      const r = await api<ReaderConfig>("POST", `/api/devices/${d.id}/opds`);
-      toast(r.detail || r.state, r.state === "failed" ? "error" : "ok");
-      loadDevices();
-    } catch (err) {
-      toast(errText(err), "error");
-    }
-    setBusy(false);
-  };
-
-  return (
-    <div>
-      <div class={settled ? "muted small" : "small warn"}>
-        {detail || "Not added to this reader yet."}
-        {d.settings.opds_at && settled && ` · ${fmtDate(d.settings.opds_at)}`}
-      </div>
-      <button type="button" disabled={busy || !d.state.online} onClick={push}>
-        {!d.state.online ? "Reader is offline" : settled ? "Add again" : "Add to the reader"}
-      </button>
-    </div>
+    </details>
   );
 }
 
@@ -365,7 +446,7 @@ function PendingRemovals({ device: d }: { device: Device }) {
 
   return (
     <div class="banner">
-      <strong>{`${d.plan.remove} books are no longer in these folders.`}</strong>
+      <strong>{`${d.plan.remove} books are no longer meant to be on this reader.`}</strong>
       <span>Syncing has paused rather than delete that many on its own.</span>
       <span class="spacer" />
       <button
@@ -402,12 +483,11 @@ function PendingRemovals({ device: d }: { device: Device }) {
 }
 
 /**
- * Books on the reader that no folder accounts for: side-loaded files, and books
- * whose file has left the folder. Everything the folders above *do* account for
- * is already shown as covers, so listing it again in a table said nothing.
+ * Files on the reader that are not books of ours at all — side-loaded EPUBs.
  *
- * These are never touched by a sync — only files Pocket Sync put there are ever
- * removed — so the point of the section is that they are visible at all.
+ * Books we sent whose file has since left the library now appear in the shelf
+ * above, in their own group, so this section is finally only what its heading
+ * says. A sync never touches these, which is the whole reason to show them.
  */
 function Strays({ device: d }: { device: Device }) {
   const [data, setData] = useState<DeviceContents | null>(null);
@@ -439,7 +519,7 @@ function Strays({ device: d }: { device: Device }) {
         <span class="caret">Also on {d.name || d.model || "this reader"}</span>
         <span class="muted small">{strays.length}</span>
         <span class="spacer" />
-        <span class="muted small">Not in your library — sync leaves these alone</span>
+        <span class="muted small">Not from your library — sync leaves these alone</span>
       </header>
       <ul class="stray-list">
         {strays.map((f) => (

@@ -13,6 +13,7 @@ import { Imports } from "./library/imports.ts";
 import { Ingest } from "./library/ingest.ts";
 import { Scanner } from "./library/scanner.ts";
 import { SyncEngine } from "./sync/engine.ts";
+import { Pins } from "./sync/pins.ts";
 import { Profiles } from "./sync/profiles.ts";
 import { KosyncServer } from "./sync/kosync.ts";
 import { Reading } from "./sync/reading.ts";
@@ -40,6 +41,7 @@ export class App {
   readonly devices: DeviceManager;
   readonly reading: Reading;
   readonly kosync: KosyncServer;
+  readonly pins: Pins;
   readonly sync: SyncEngine;
   /** The OPDS catalog. Its own LAN listener, off unless the user turns it on. */
   readonly opds: OpdsServer;
@@ -106,6 +108,7 @@ export class App {
       this.config,
       this.log,
     );
+    this.pins = new Pins(this.db);
     this.sync = new SyncEngine(
       this.db,
       this.config,
@@ -115,6 +118,7 @@ export class App {
       this.sidecar,
       this.scanner,
       this.kosync,
+      this.pins,
       this.log,
       this.bus,
     );

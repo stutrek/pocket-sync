@@ -115,6 +115,17 @@ main {
   margin: 0;
   font-size: 16px;
 }
+
+/* Where the Send button on every cover points. One target, chosen once, is what
+   lets each card carry a single unambiguous button instead of a reader menu. */
+.sending-to {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 4px;
+  border-left: 1px solid var(--border);
+  border-right: 1px solid var(--border);
+}
 .spacer {
   flex: 1;
 }
@@ -241,6 +252,54 @@ button:disabled {
   top: 8px;
   right: 8px;
   z-index: 2;
+}
+
+/* Send this book to the reader named in the toolbar — the app's primary
+   gesture, so it shares the selection checkbox's corner (the two are never
+   shown together) and stays out of the way until the pointer is on the card. */
+.send-mark {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  z-index: 2;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  line-height: 20px;
+  text-align: center;
+  font-size: 13px;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--muted);
+  opacity: 0;
+  transition: opacity 120ms;
+}
+
+/* Revealed on hover — but once the book is on the reader the mark is state
+   rather than an action, so those two stay visible all the time. */
+.card:hover .send-mark,
+.send-mark:focus-visible,
+.send-mark.on,
+.send-mark.rule {
+  opacity: 1;
+}
+
+.send-mark.on {
+  border-color: var(--ok);
+  color: var(--ok);
+}
+
+/* A book a folder rule put there cannot be taken off from here, so it must not
+   look like a button. */
+.send-mark.rule {
+  color: var(--muted);
+  cursor: default;
+}
+
+button.send-mark:hover {
+  border-color: var(--accent);
+  color: var(--accent);
 }
 
 /* Is this book on my reader? Green yes, orange on its way, grey no. The ring
@@ -569,6 +628,84 @@ button:disabled {
   height: 32px;
   padding-top: 0;
   padding-bottom: 0;
+}
+
+.scope-head h2 {
+  cursor: text;
+}
+
+/* What this reader holds and why, in one line under its name: the folder rules
+   are the headline fact about a reader, not a column of checkboxes. */
+.scope-facts {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 13px;
+  margin-bottom: 6px;
+}
+
+/* Where a drop lands when there is no folder under the cursor. Always visible:
+   a hidden drop target is how you get a drop that goes nowhere. */
+.drop-strip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 6px 8px;
+  margin-bottom: 8px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+}
+
+.drop-strip .dropzone {
+  font-size: 13px;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.drop-strip .dropzone.hot {
+  color: var(--accent);
+}
+
+.drop-strip .dropzone input {
+  display: none;
+}
+
+/* One row per reader in the book drawer — the complete view, where the shelf's
+   Send button covers only the reader named in the toolbar. */
+.reader-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 3px 0;
+}
+
+/* The send marks in the drawer are inline, not pinned to a cover. */
+.reader-row .send-mark {
+  position: static;
+  opacity: 1;
+}
+
+/* A reader we have only just met, offered once at the top of the library. */
+.banner.new-reader {
+  align-items: flex-start;
+}
+
+.banner .grow {
+  flex: 1;
+}
+
+.banner.new-reader .rule {
+  margin-top: 6px;
+  flex-wrap: wrap;
+}
+
+/* Getting books in and naming people are library actions, not settings. */
+.rail-actions li {
+  color: var(--accent);
+  cursor: pointer;
 }
 .rule {
   display: flex;
@@ -1023,11 +1160,6 @@ button:disabled {
   border-top: none;
 }
 
-/* A folder that doesn't sync here is context, not the subject of the page. */
-.folder-group.unbound .folder-head .caret {
-  color: var(--muted);
-}
-
 .folder-group.hot {
   background: color-mix(in srgb, var(--accent) 6%, transparent);
 }
@@ -1049,11 +1181,6 @@ button:disabled {
 
 .folder-head .caret:hover {
   color: var(--accent);
-}
-
-.folder-head .check {
-  font-size: 13px;
-  color: var(--muted);
 }
 
 .folder-row code {

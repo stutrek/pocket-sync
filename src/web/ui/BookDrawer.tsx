@@ -1,6 +1,7 @@
 import { useEffect, useState } from "preact/hooks";
 import { api, errText, fmtBytes, fmtDate } from "./api.ts";
-import { detailBookId, loadBooks, toast } from "./store.ts";
+import { Check } from "./components.tsx";
+import { detailBookId, devices, libraries, loadBooks, send, toast } from "./store.ts";
 import type { BookDetail } from "./types.ts";
 
 /** Slide-over detail panel. Mounted only while `detailBookId` is set. */
@@ -85,18 +86,9 @@ export function BookDrawer({ id }: { id: string }) {
         </div>
       ))}
 
+      <Readers book={book} onChange={reload} />
+
       <div class="toolbar" style="margin-top:12px">
-        <button
-          type="button"
-          onClick={async () => {
-            await api("POST", `/api/books/${id}/resend`);
-            toast("Marked for re-send", "ok");
-            close();
-            loadBooks();
-          }}
-        >
-          Re-send on next sync
-        </button>
         {
           /* Books that exist only in a read-only source are not ours to delete:
             the file belongs to the app that made it, and the endpoint refuses. */
@@ -127,6 +119,77 @@ export function BookDrawer({ id }: { id: string }) {
             </span>
           )}
       </div>
+    </div>
+  );
+}
+
+/**
+ * Which readers have this book, and which of them you can do anything about.
+ *
+ * The card on the shelf sends to one reader — the one in the toolbar — because
+ * that is the fast path. This is the complete view, for the household with two
+ * readers, and the only place a rule-covered copy explains itself: unticking it
+ * would do nothing, because the folder rule would put it straight back on the
+ * next sync.
+ */
+function Readers({ book, onChange }: { book: BookDetail; onChange: () => void }) {
+  const all = devices.value;
+  if (!all.length) return null;
+
+  return (
+    <div class="drawer-lib">
+      <div class="muted">On which readers</div>
+      {all.map((d) => {
+        const name = d.name || d.model || d.id;
+        const on = book.devices.some((x) => x.device_id === d.id);
+        const byHand = book.pinnedTo.includes(d.id);
+        const rule = libraries.value.find((l) =>
+          l.deviceIds.includes(d.id) && book.libraries.some((b) => b.library_id === l.id)
+        );
+
+        if (rule && !byHand) {
+          return (
+            <div key={d.id} class="reader-row">
+              <span class="send-mark rule">✓</span>
+              <span>{name}</span>
+              <span class="muted small">{`kept in step by the “${rule.name}” rule`}</span>
+            </div>
+          );
+        }
+        return (
+          <div key={d.id} class="reader-row">
+            <Check
+              label={name}
+              checked={on || byHand}
+              onChange={async (v) => {
+                await send(d.id, [book.id], v);
+                onChange();
+              }}
+            />
+            <span class="muted small">
+              {byHand && !on
+                ? d.state.online ? "sending…" : `waiting for ${name} to wake`
+                : byHand
+                ? "sent by you"
+                : ""}
+            </span>
+            {on && (
+              <button
+                type="button"
+                class="link"
+                title="Send the file again — for a copy that arrived damaged"
+                onClick={async () => {
+                  await api("POST", `/api/books/${book.id}/resend`);
+                  toast("Will be sent again on the next sync", "ok");
+                  loadBooks();
+                }}
+              >
+                resend
+              </button>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }

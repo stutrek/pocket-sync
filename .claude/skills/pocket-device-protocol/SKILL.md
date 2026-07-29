@@ -158,16 +158,16 @@ unknown — every path has to work without it.
 
 ### The document hash the reader reports
 
-Binary matching means KOReader's `util.partialMD5`: 1 KiB sampled at `bit.lshift(1024, 2*i)` for
-`i` in −1..10. **Those offsets are not `1024 * 4^i`.** LuaJIT takes a shift count modulo 32, so
-`i = -1` shifts left by 30, overflows 32 bits and wraps to **offset 0** — the head of the file. The
+Binary matching means KOReader's `util.partialMD5`: 1 KiB sampled at `bit.lshift(1024, 2*i)` for `i`
+in −1..10. **Those offsets are not `1024 * 4^i`.** LuaJIT takes a shift count modulo 32, so `i = -1`
+shifts left by 30, overflows 32 bits and wraps to **offset 0** — the head of the file. The
 arithmetic reading starts at 256 instead, and then every digest is wrong, every report maps to no
 book, and nothing anywhere errors: the reader gets its 200, asks for the position back, is answered
 `{}`, and shows the book at page one "updated by null". `koreaderPartialMd5()` in `src/core/hash.ts`
 holds the offsets and `tests/acceptance.sh` step 18b walks the whole loop against an independent
 transcription of the Lua.
 
-Because hashes are recorded only when a book is *sent*, changing how they are computed strands every
+Because hashes are recorded only when a book is _sent_, changing how they are computed strands every
 book already on a reader. `DOCUMENT_HASH_VERSION` + `remapDeliveredDocuments()` in
 `src/sync/engine.ts` re-derive them once at the next start; bump the constant with any such change.
 

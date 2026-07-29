@@ -20,10 +20,18 @@ export type {
   UserConfig,
 };
 
-/** `GET /api/library` — a book within one folder, with reading and device state. */
+/**
+ * `GET /api/library` — a book within one folder, with reading and device state.
+ *
+ * `onDevices` is where it is; `pinnedTo` is which of those readers were told to
+ * take it by hand. A reader in the first list but not the second carries it
+ * because a folder rule covers it, and offering to un-send it there would be a
+ * lie — the rule would put it straight back.
+ */
 export interface LibraryBook extends LibraryRow {
   hasCover: boolean;
   onDevices: string[];
+  pinnedTo: string[];
 }
 
 /** `GET /api/libraries`. */
@@ -83,11 +91,15 @@ export interface BookDetail {
   /** Progress per person — reading state belongs to users, not folders. */
   reading: { userId: string; name: string; state: ReadingState | null }[];
   devices: { device_id: string; name: string | null; synced_at: string | null }[];
+  /** Readers told to take this book by hand, as opposed to by a folder rule. */
+  pinnedTo: string[];
 }
 
 /** What the next sync would do, without touching the device. */
 export interface SyncPlan {
   folders: { id: string; name: string }[];
+  /** How many books were sent to this reader by hand. */
+  sent: number;
   send: number;
   remove: number;
   onDevice: number;
@@ -99,7 +111,9 @@ export interface SyncPlan {
 export interface Device extends DeviceRow {
   state: DeviceState;
   settings: DeviceSettings;
+  /** The folder rules feeding this reader. */
   libraryIds: string[];
+  pinnedBookIds: string[];
   plan: SyncPlan;
   contentCount: number;
 }
@@ -271,8 +285,18 @@ export type Tab = "library" | "settings" | "activity";
 /**
  * What the library view is showing. The whole library, one person's shelf, or
  * one reader's — the three levels the rail lays out, in that order.
+ *
+ * Each scope now decides its own *contents*, not just its annotations: the
+ * server resolves it (`src/library/shelf.ts`) and returns that reader's or that
+ * person's books, along with whose reading progress to attach.
  */
 export type Scope =
   | { kind: "all" }
   | { kind: "user"; id: string }
   | { kind: "device"; id: string };
+
+/** The wire form the server parses. */
+export const scopeParam = (s: Scope) => s.kind === "all" ? "all" : `${s.kind}:${s.id}`;
+
+/** How the shelf is carved up. Folders are the sync unit, not the only lens. */
+export type GroupBy = "folder" | "author" | "series" | "recent";

@@ -23,6 +23,8 @@ import { joinDevicePath, normalizeDevicePath } from "../src/device/client.ts";
 import { stableIdentity } from "../src/device/manager.ts";
 import { metadataFromFilename, parseMetaOutput } from "../src/library/calibre.ts";
 import { profileHash, type ResampleProfile } from "../src/sync/profiles.ts";
+import { groupsFor } from "../src/web/ui/grouping.ts";
+import type { Library as UiLibrary, LibraryBook } from "../src/web/ui/types.ts";
 
 Deno.test("ids: newId is sortable and unique", () => {
   const early = newId(1_000_000);
@@ -65,6 +67,35 @@ Deno.test("ids: books are placed in the folders they sit in on disk", () => {
       .get(books[0].id)?.dir,
     ["Sci Fi 1970s"],
   );
+});
+
+Deno.test("ids: a hand-sent book is filed under its own folder", () => {
+  // A book sent to a reader out of a folder no rule covers still mirrors that
+  // folder. Not a nicety: it is what makes adding the rule afterwards a no-op
+  // rather than a send-then-delete for every book already up there — and it
+  // keeps sent books out of the upload root, where every folder name lives and
+  // collisions are likeliest.
+  const ruled = [
+    { id: "a".repeat(32), title: "Dune", author: "Frank Herbert", relDir: ["Fiction"] },
+    { id: "b".repeat(32), title: "Emma", author: "Jane Austen", relDir: ["Fiction"] },
+  ];
+  const sent = { id: "c".repeat(32), title: "Maus", author: "Art Spiegelman", relDir: ["Comics"] };
+
+  const withSent = devicePlacements([...ruled, sent]);
+  assertEquals(withSent.get(sent.id)?.dir, ["Comics"]);
+
+  // Adding it must not disturb where the rule-covered books already sit, and
+  // its own placement must be the same as if the rule had covered it all along.
+  const ruleOnly = devicePlacements(ruled);
+  for (const book of ruled) {
+    assertEquals(withSent.get(book.id), ruleOnly.get(book.id), `${book.title} moved`);
+  }
+  const asIfRuled = devicePlacements([...ruled, sent]);
+  assertEquals(withSent.get(sent.id), asIfRuled.get(sent.id));
+
+  // It lands in a folder of its own, so it cannot collide with anything the
+  // rules put on the reader.
+  assert(withSent.get(sent.id)?.filename === "Maus - Art Spiegelman.epub");
 });
 
 Deno.test("ids: names collide only within a folder, and break deterministically", () => {
@@ -1296,7 +1327,7 @@ Deno.test("kosync: sync servers are per person, ours first", async (t) => {
     assertEquals(got.settings.koMatchMethod, 1);
   });
 
-  await t.step("a pinned server overrides the holder's default", () => {
+  await t.step("a server override beats the holder's default", () => {
     const pinned = kosync.readerSettings("u1", LOCAL_SYNC_SERVER_ID);
     // Ours may be unavailable on a machine with no LAN address; either way it
     // must not silently resolve to the *other* server.
@@ -1304,13 +1335,13 @@ Deno.test("kosync: sync servers are per person, ours first", async (t) => {
     else assertMatch(pinned.reason, /LAN address|turned off/);
   });
 
-  await t.step("an unknown pin falls back to the default rather than failing", () => {
+  await t.step("an unknown override falls back to the default rather than failing", () => {
     const got = kosync.readerSettings("u1", "deleted-while-offline");
     assert(got.ok, got.ok ? "" : got.reason);
     assertEquals(got.server.id, added);
   });
 
-  await t.step("removing the default falls back to ours, and unpins its readers", () => {
+  await t.step("removing the default falls back to ours, and clears its readers' overrides", () => {
     const now = new Date().toISOString();
     db.run("INSERT INTO device (id, first_seen, last_seen) VALUES ('dev1', ?, ?)", now, now);
     db.run(
@@ -1447,4 +1478,118 @@ Deno.test("opds: feed text is XML-escaped, and download names are header-safe", 
     asciiFilename({ id: "abc123", title: "日本語", author: "著者" }),
     "abc123.epub",
   );
+});
+
+// --- the shelf's groupings --------------------------------------------------
+//
+// `grouping.ts` is deliberately free of preact imports so it can be tested here.
+// It is pure: rows in, headed sections out.
+
+const shelfBook = (
+  over: Partial<LibraryBook> & { id: string },
+): LibraryBook => ({
+  title: "Untitled",
+  author: "Anon",
+  series: null,
+  series_index: null,
+  added_at: "2026-01-01T00:00:00.000Z",
+  cover_path: null,
+  original_ext: "epub",
+  epub_path: null,
+  size_bytes: 0,
+  meta_json: "{}",
+  library_id: "fiction",
+  path: "/books/x.epub",
+  percentage: 0,
+  finished: 0,
+  hasCover: false,
+  onDevices: [],
+  pinnedTo: [],
+  ...over,
+});
+
+const folder = (id: string, name: string): UiLibrary => ({
+  id,
+  name,
+  path: `/books/${id}`,
+  relPath: id,
+  deviceIds: [],
+  books: 0,
+});
+
+Deno.test("shelf: folders keep their headers, and orphans get their own", () => {
+  const folders = [folder("fiction", "Fiction"), folder("comics", "Comics")];
+  const groups = groupsFor(
+    [
+      shelfBook({ id: "a", title: "Dune", library_id: "fiction" }),
+      // On the reader, but its file has left every watched folder. A sync never
+      // removes these, so the shelf must not silently drop them either.
+      shelfBook({ id: "b", title: "Ghost", library_id: null, path: null }),
+    ],
+    folders,
+    "folder",
+  );
+
+  assertEquals(groups.map((g) => g.label), ["Fiction", "Comics", "Not in a watched folder"]);
+  // An empty folder you have just started watching must not look like it failed.
+  assertEquals(groups[1].books.length, 0);
+  assertEquals(groups[2].books.map((b) => b.id), ["b"]);
+  // Only real folders take a drop; "Not in a watched folder" is not a place.
+  assertEquals(groups.map((g) => g.dropTo), ["fiction", "comics", undefined]);
+});
+
+Deno.test("shelf: series read in order, and standalones do not become sections", () => {
+  const groups = groupsFor(
+    [
+      shelfBook({ id: "c", title: "Third", series: "Earthsea", series_index: 3 }),
+      shelfBook({ id: "a", title: "First", series: "Earthsea", series_index: 1 }),
+      shelfBook({ id: "x", title: "Piranesi" }),
+      shelfBook({ id: "y", title: "Maus" }),
+    ],
+    [],
+    "series",
+  );
+
+  assertEquals(groups.map((g) => g.label), ["Earthsea", "Standalone"]);
+  // The one grouping where order *inside* a section carries meaning.
+  assertEquals(groups[0].books.map((b) => b.title), ["First", "Third"]);
+  // Most of a library is standalone, and a hundred one-book sections is not a
+  // shelf — so they land in one group, closed until asked for.
+  assertEquals(groups[1].books.length, 2);
+  assertEquals(groups[1].closedByDefault, true);
+});
+
+Deno.test("shelf: authors sort, and a missing one is still a group", () => {
+  const groups = groupsFor(
+    [
+      shelfBook({ id: "b", author: "Ursula K. Le Guin" }),
+      shelfBook({ id: "a", author: "Ada Lovelace" }),
+      shelfBook({ id: "c", author: "" }),
+    ],
+    [],
+    "author",
+  );
+  assertEquals(groups.map((g) => g.label), ["Ada Lovelace", "Unknown author", "Ursula K. Le Guin"]);
+});
+
+Deno.test("shelf: recency buckets, and a book cannot fall out of all of them", () => {
+  const now = new Date();
+  const ago = (days: number) => new Date(now.getTime() - days * 86_400_000 - 60_000).toISOString();
+
+  const groups = groupsFor(
+    [
+      shelfBook({ id: "old", added_at: ago(90) }),
+      shelfBook({ id: "new", added_at: ago(0) }),
+      shelfBook({ id: "week", added_at: ago(3) }),
+      // A bad mtime or a clock skew must not vanish a book.
+      shelfBook({ id: "broken", added_at: "not a date" }),
+    ],
+    [],
+    "recent",
+  );
+
+  assertEquals(groups.map((g) => g.label), ["Today", "This week", "Earlier"]);
+  assertEquals(groups[0].books.map((b) => b.id), ["new"]);
+  assertEquals(groups[1].books.map((b) => b.id), ["week"]);
+  assertEquals(new Set(groups[2].books.map((b) => b.id)), new Set(["old", "broken"]));
 });

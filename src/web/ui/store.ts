@@ -1,9 +1,11 @@
 // All shared UI state. Components read signals directly and re-render on change;
 // nothing here touches the DOM.
 import { signal } from "@preact/signals";
-import { api } from "./api.ts";
+import { api, errText } from "./api.ts";
+import { scopeParam } from "./types.ts";
 import type {
   Device,
+  GroupBy,
   ImportJob,
   Library,
   LibraryBook,
@@ -34,9 +36,13 @@ export const settings = signal<Settings | null>(null);
 
 export const query = signal("");
 /**
- * Whose shelf is on screen: everything, one person's, or one reader's. The
- * whole library is always fetched — scope decides which folders are shown and,
- * because reading state is per person, whose progress is attached.
+ * Whose shelf is on screen: everything, one person's, or one reader's.
+ *
+ * The scope decides the *contents*, not just the annotations — the server
+ * resolves it (`src/library/shelf.ts`) and answers with that reader's or that
+ * person's books, plus whose reading progress to attach. Picking a person used
+ * to show the whole library with different checkboxes, which is why the rail
+ * never felt like it was taking you anywhere.
  */
 export const scope = signal<Scope>({ kind: "all" });
 export const readingFilter = signal<ReadingFilter>("all");
@@ -72,34 +78,94 @@ export const statusError = signal<string | null>(null);
 
 export const LEVELS: Record<LogLevel, number> = { debug: 10, info: 20, warn: 30, error: 40 };
 
-// --- scope ------------------------------------------------------------------
+// --- persisted preferences --------------------------------------------------
 
-/**
- * Whose reading progress the current scope implies: the person themselves, the
- * person holding the reader, or — looking at the whole library — the first
- * person on the list. A shelf is always somebody's, so there is no "nobody".
- */
-export function scopeUserId(s: Scope = scope.value): string {
-  if (s.kind === "user") return s.id;
-  if (s.kind === "device") {
-    return devices.value.find((d) => d.id === s.id)?.settings.user_id ?? users.value[0]?.id ?? "";
+const FOLDER_OPEN_KEY = "pocketsync.folderOpen";
+const TARGET_KEY = "pocketsync.target";
+const GROUP_KEY = "pocketsync.groupBy";
+const DROP_KEY = "pocketsync.dropTo";
+
+/** Private-mode storage throws; a preference is never worth failing a render. */
+function read(key: string): string | null {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
   }
-  return users.value[0]?.id ?? "";
 }
+
+function write(key: string, value: string | null) {
+  try {
+    if (value === null) localStorage.removeItem(key);
+    else localStorage.setItem(key, value);
+  } catch {
+    // Ignored for the same reason as above.
+  }
+}
+
+// --- scope and target -------------------------------------------------------
 
 export function setScope(next: Scope) {
   scope.value = next;
   clearSelection();
+  // Looking at a reader is the clearest possible statement of where a send
+  // should go, so the page you are on picks the target for you.
+  if (next.kind === "device") target.value = next.id;
   loadBooks();
 }
 
-// --- folder collapse --------------------------------------------------------
+/**
+ * Which reader the Send button on each cover means.
+ *
+ * The alternative was a menu per card, which needs a positioned popover the
+ * component set does not have — and which asks the same question hundreds of
+ * times when the answer changes about once a week. One target, chosen once,
+ * makes every card's button unambiguous and gives the dot on the cover a single
+ * meaning: on *that* reader, or not.
+ */
+export const target = signal<string | null>(read(TARGET_KEY));
 
-const FOLDER_OPEN_KEY = "pocketsync.folderOpen";
+export function setTarget(deviceId: string | null) {
+  target.value = deviceId;
+  write(TARGET_KEY, deviceId);
+}
+
+/**
+ * The target must name a reader that still exists, and a fresh install has none
+ * chosen. Resolved against the loaded devices rather than trusted from storage.
+ */
+export function resolveTarget(): string | null {
+  const all = devices.value;
+  if (!all.length) return null;
+  const scoped = scope.value;
+  if (scoped.kind === "device") return scoped.id;
+  if (scoped.kind === "user") {
+    const held = users.value.find((u) => u.id === scoped.id)?.deviceIds ?? [];
+    if (held.length) return held.includes(target.value ?? "") ? target.value : held[0];
+  }
+  if (target.value && all.some((d) => d.id === target.value)) return target.value;
+  return all[0].id;
+}
+
+/** Folders are the sync unit; they are not the only way to find a book. */
+export const groupBy = signal<GroupBy>((read(GROUP_KEY) as GroupBy) ?? "folder");
+
+export function setGroupBy(next: GroupBy) {
+  groupBy.value = next;
+  write(GROUP_KEY, next);
+}
+
+/** Where a drop lands when the shelf is not grouped by folder. */
+export const dropTo = signal<string | null>(read(DROP_KEY));
+
+export function setDropTo(libraryId: string) {
+  dropTo.value = libraryId;
+  write(DROP_KEY, libraryId);
+}
 
 function readFolderOpen(): Record<string, boolean> {
+  const raw = read(FOLDER_OPEN_KEY);
   try {
-    const raw = localStorage.getItem(FOLDER_OPEN_KEY);
     return raw ? JSON.parse(raw) as Record<string, boolean> : {};
   } catch {
     return {};
@@ -115,11 +181,7 @@ export const folderOpen = signal<Readonly<Record<string, boolean>>>(readFolderOp
 export function setFolderOpen(id: string, open: boolean) {
   const next = { ...folderOpen.value, [id]: open };
   folderOpen.value = next;
-  try {
-    localStorage.setItem(FOLDER_OPEN_KEY, JSON.stringify(next));
-  } catch {
-    // Private-mode storage failures are not worth a toast; the view still works.
-  }
+  write(FOLDER_OPEN_KEY, JSON.stringify(next));
 }
 
 // --- toasts ----------------------------------------------------------------
@@ -152,6 +214,43 @@ export function toggleSelected(id: string, on: boolean) {
 
 export const clearSelection = () => (selection.value = new Set());
 
+// --- sending ----------------------------------------------------------------
+
+/**
+ * Put books on a reader, or take them off again.
+ *
+ * The server starts the sync and does not wait for it, so this returns as soon
+ * as the instruction is recorded — the reader may well be asleep, and the books
+ * go when it wakes. Both lists reload because the card's state comes from
+ * `/api/library` and the reader's counts from `/api/devices`.
+ */
+export async function send(deviceId: string, bookIds: string[], on: boolean) {
+  if (!bookIds.length) return;
+  const one = bookIds.length === 1;
+  const path = one
+    ? `/api/devices/${deviceId}/pins/${encodeURIComponent(bookIds[0])}`
+    : `/api/devices/${deviceId}/pins`;
+  try {
+    const result = await api<{ online: boolean }>(
+      on ? "PUT" : "DELETE",
+      path,
+      one ? undefined : { bookIds },
+    );
+    const what = one ? "Book" : `${bookIds.length} books`;
+    const name = devices.value.find((d) => d.id === deviceId);
+    const label = name?.name || name?.model || "the reader";
+    toast(
+      on
+        ? result.online ? `${what} sending to ${label}…` : `${what} queued for ${label}`
+        : `${what} will come off ${label}`,
+      "ok",
+    );
+    await Promise.all([loadBooks(), loadDevices()]);
+  } catch (err) {
+    toast(errText(err), "error");
+  }
+}
+
 // --- loaders ----------------------------------------------------------------
 
 export async function loadStatus() {
@@ -164,28 +263,18 @@ export async function loadStatus() {
 }
 
 /**
- * Every folder's books in one request — the shelf groups them client-side, so
- * narrowing to a folder here would only cost a round trip per expand.
+ * The scope's books in one request — the shelf groups them client-side, so
+ * narrowing further here would only cost a round trip per expand.
+ *
+ * The server works out whose reading progress belongs on these rows, which is
+ * why there is no `user` parameter and no client-side race between "the devices
+ * arrived" and "the books arrived" to reconcile afterwards.
  */
 export async function loadBooks() {
-  const params = new URLSearchParams();
+  const params = new URLSearchParams({ scope: scopeParam(scope.value) });
   if (query.value) params.set("query", query.value);
-  const user = scopeUserId();
-  if (user) params.set("user", user);
   if (readingFilter.value !== "all") params.set("reading", readingFilter.value);
-  lastBooksUser = user;
   books.value = await api<LibraryBook[]>("GET", `/api/library?${params}`);
-}
-
-/**
- * Which person the loaded shelf carries progress for. People and devices arrive
- * in parallel with the first book fetch, so the answer can change right after
- * it — without this the opening shelf silently shows nobody's progress.
- */
-let lastBooksUser: string | null = null;
-
-function reloadBooksIfUserChanged() {
-  if (lastBooksUser !== null && lastBooksUser !== scopeUserId()) loadBooks();
 }
 
 export async function loadLibraries() {
@@ -199,9 +288,8 @@ export async function loadRoot() {
 export async function loadUsers() {
   users.value = await api<User[]>("GET", "/api/users");
   const s = scope.value;
-  // The person whose shelf is open may have just been removed in Settings.
-  if (s.kind === "user" && !users.value.some((u) => u.id === s.id)) scope.value = { kind: "all" };
-  reloadBooksIfUserChanged();
+  // The person whose shelf is open may have just been removed.
+  if (s.kind === "user" && !users.value.some((u) => u.id === s.id)) setScope({ kind: "all" });
 }
 
 export async function loadInbox() {
@@ -213,9 +301,11 @@ export async function loadDevices() {
   const s = scope.value;
   // Likewise for a reader that was forgotten, here or from another window.
   if (s.kind === "device" && !devices.value.some((d) => d.id === s.id)) {
-    scope.value = { kind: "all" };
+    setScope({ kind: "all" });
   }
-  reloadBooksIfUserChanged();
+  // A forgotten reader must not stay the send target, or every Send button
+  // points at something that is not there any more.
+  if (target.value && !devices.value.some((d) => d.id === target.value)) setTarget(null);
 }
 
 export async function loadProfiles() {

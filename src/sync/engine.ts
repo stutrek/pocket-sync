@@ -19,11 +19,13 @@ import type { Book, Books } from "../library/books.ts";
 import { fmtBytes } from "../library/ingest.ts";
 import type { Scanner } from "../library/scanner.ts";
 import type { KosyncServer } from "./kosync.ts";
+import type { Pins } from "./pins.ts";
 import { Profiles, type ResampleProfile } from "./profiles.ts";
 
 /**
- * What is left of the old sync rule. The bound folder is the source, so there
- * is no source type, no list and no mode to choose (docs/DESIGN.md).
+ * What is left of the old sync rule. A folder rule and a book sent by hand are
+ * the two ways into a device's desired set, so there is no source type, no list
+ * and no mode to choose (docs/DESIGN.md).
  */
 export interface DeviceSettings {
   device_id: string;
@@ -49,6 +51,12 @@ export interface DeviceSettings {
   opds_state: ReaderConfigState | null;
   opds_detail: string | null;
   opds_at: string | null;
+  /**
+   * When the user first looked at this reader — not when it was configured.
+   * Everything that needs configuring is pushed automatically; this only stops
+   * the "new reader" card offering to introduce a reader you have already met.
+   */
+  setup_at: string | null;
 }
 
 /**
@@ -140,6 +148,7 @@ export class SyncEngine {
     private readonly sidecar: Sidecar,
     private readonly scanner: Scanner,
     private readonly kosync: KosyncServer,
+    readonly pins: Pins,
     private readonly log: Logger,
     private readonly bus: EventBus,
   ) {}
@@ -179,35 +188,37 @@ export class SyncEngine {
   /**
    * Handing a reader to someone else re-points it at *their* default server.
    *
-   * A pinned server belongs to the person who pinned it — it is an id from
-   * their list, and the new holder may not even have that server — so the pin
-   * is dropped rather than carried across. Clearing the fingerprint alongside
-   * it is what makes the next `configureReader()` actually push, instead of
-   * short-circuiting on settings the previous holder accepted.
+   * A server override belongs to the person who set it — it is an id from
+   * their list, and the new holder may not even have that server — so the
+   * override is dropped rather than carried across. Clearing the fingerprint
+   * alongside it is what makes the next `configureReader()` actually push,
+   * instead of short-circuiting on settings the previous holder accepted.
    */
   setSettings(deviceId: string, patch: Partial<DeviceSettings>): DeviceSettings {
     const before = this.settings(deviceId);
     const next = { ...before, ...patch };
     const rehomed = patch.user_id !== undefined && patch.user_id !== before.user_id;
     if (rehomed && patch.sync_server_id === undefined) next.sync_server_id = null;
-    const pinChanged = next.sync_server_id !== before.sync_server_id;
+    const overrideChanged = next.sync_server_id !== before.sync_server_id;
 
     this.db.run(
       `UPDATE device_settings
-          SET profile_id = ?, user_id = ?, enabled = ?, auto_on_connect = ?, sync_server_id = ?
+          SET profile_id = ?, user_id = ?, enabled = ?, auto_on_connect = ?, sync_server_id = ?,
+              setup_at = ?
         WHERE device_id = ?`,
       next.profile_id,
       next.user_id,
       bit(next.enabled),
       bit(next.auto_on_connect),
       next.sync_server_id,
+      next.setup_at,
       deviceId,
     );
-    if (rehomed || pinChanged) {
+    if (rehomed || overrideChanged) {
       this.db.run("UPDATE device_settings SET kosync_hash = NULL WHERE device_id = ?", deviceId);
     }
     // The catalog entry carries the holder's name as its username, so a new
-    // holder has to re-push it too — but a changed *pin* is page sync only.
+    // holder has to re-push it too — but a changed *override* is page sync only.
     if (rehomed) {
       this.db.run("UPDATE device_settings SET opds_hash = NULL WHERE device_id = ?", deviceId);
     }
@@ -222,10 +233,10 @@ export class SyncEngine {
    * moves this machine. The firmware takes the same JSON block its settings
    * page posts (see the `pocket-device-protocol` skill), so we write it.
    *
-   * "The right server" is the one pinned on the device, else the holder's
+   * "The right server" is the device's own override, else the holder's
    * default, else ours. Called at the top of every sync; the fingerprint of
    * what the reader last accepted short-circuits it before any request, so the
-   * steady state costs nothing, while a changed holder, pin, port or LAN
+   * steady state costs nothing, while a changed holder, override, port or LAN
    * address re-pushes by itself.
    *
    * Never throws: a reader that will not take its settings still syncs books,
@@ -585,14 +596,27 @@ export class SyncEngine {
    */
   placementsFor(
     libs: { id: string; name: string; path: string }[],
+    extraBookIds: string[] = [],
   ): Map<string, DevicePlacement & { devicePath: string }> {
     const targetDir = normalizeDevicePath(this.config.current.upload.path || "/");
     const libraryIds = libs.map((l) => l.id);
-    const roots = new Map(libs.map((l) => [l.id, { name: l.name, path: l.path }]));
-    const sources = this.books.sourcePathsForLibraries(libraryIds);
+    // Every configured folder, not just the ruled ones: this is a lookup table
+    // for "what is this folder called", and a book sent by hand out of a folder
+    // no rule covers still files under that folder's name. Scoping it to `libs`
+    // would drop such a book at the upload root — where it would collide with
+    // every folder name, and where adding the rule later would then have to
+    // move it.
+    const roots = new Map(
+      this.scanner.libraries.map((l) => [l.id, { name: l.name, path: l.path }]),
+    );
+    // One title-ordered list rather than a concatenation: `devicePlacements()`
+    // breaks name collisions across the whole set at once, so the outcome has to
+    // not depend on which half a book arrived in.
+    const ids = this.books.idsForDevice(libraryIds, extraBookIds);
+    const sources = this.books.sourcePathsFor(ids, libraryIds);
 
     const placements = devicePlacements(
-      this.books.idsForLibraries(libraryIds)
+      ids
         .map((id) => this.books.get(id))
         .filter((b): b is Book => !!b)
         .map((b) => {
@@ -625,10 +649,11 @@ export class SyncEngine {
   plan(deviceId: string) {
     const libs = this.scanner.librariesForDevice(deviceId);
     const folders = libs.map((l) => ({ id: l.id, name: l.name }));
-    if (!libs.length) {
-      return { folders, send: 0, remove: 0, onDevice: 0, needsConfirm: false };
+    const pinned = this.pins.idsFor(deviceId);
+    if (!libs.length && !pinned.length) {
+      return { folders, sent: 0, send: 0, remove: 0, onDevice: 0, needsConfirm: false };
     }
-    const desired = new Set(this.books.idsForLibraries(libs.map((l) => l.id)));
+    const desired = new Set(this.books.idsForDevice(libs.map((l) => l.id), pinned));
     const present = this.db.all<{ book_id: string; device_path: string }>(
       "SELECT book_id, device_path FROM device_content WHERE device_id = ?",
       deviceId,
@@ -638,13 +663,15 @@ export class SyncEngine {
     // A book on the reader in the wrong place is re-sent, not left — so the
     // preview has to count it, or "0 to send" would be followed by a sync that
     // moves half the shelf.
-    const placements = this.placementsFor(libs);
+    const placements = this.placementsFor(libs, pinned);
     const misplaced = present.filter((r) =>
       desired.has(r.book_id) &&
       normalizeDevicePath(r.device_path) !== placements.get(r.book_id)?.devicePath
     ).length;
     return {
       folders,
+      /** Books sent by hand, so the reader's page can offer to clear them. */
+      sent: pinned.length,
       send: [...desired].filter((id) => !presentSet.has(id)).length + misplaced,
       remove,
       onDevice: present.length,
@@ -652,6 +679,11 @@ export class SyncEngine {
        * An automatic sync will stop rather than delete this many, so the UI has
        * to offer the confirmation — otherwise the removals wait forever. Decided
        * here so the threshold stays in one place.
+       *
+       * Un-sending one book is deliberately *not* what this catches: the user
+       * just said to take it off, and a confirmation for an action that
+       * explicit is noise. The confirmable action is removing a folder rule,
+       * which the route gates with this same threshold.
        */
       needsConfirm: remove > REMOVAL_CONFIRM_THRESHOLD,
     };
@@ -757,13 +789,28 @@ export class SyncEngine {
     if (!settings.enabled && trigger !== "manual") return this.#empty(deviceId, "sync disabled");
 
     const libs = this.scanner.librariesForDevice(deviceId);
-    if (!libs.length) return this.#empty(deviceId, "no folder bound to this device");
+    const pinned = this.pins.idsFor(deviceId);
+    // A reader with no folder rule but a book sent by hand has real work to do —
+    // under this model that is the ordinary case, not an edge one.
+    if (!libs.length && !pinned.length) return this.#empty(deviceId, "nothing to sync");
 
     // Reconciliation deletes, so an unreadable folder must never reach the diff
     // as "zero books" — an unplugged drive would clear the reader. With several
     // folders the whole sync has to abort: books from the missing one would look
     // removed, and we cannot tell that apart from the user deleting them.
-    for (const lib of libs) {
+    //
+    // The folders holding sent books count too, and the rules alone do not name
+    // them: a book sent out of a folder on an unmounted drive is in the desired
+    // set (its `library_book` row outlives the mount) and would fail per book
+    // with nothing saying why.
+    const holding = new Set(this.books.librariesHolding(pinned));
+    const toScan = [...libs];
+    for (const id of holding) {
+      if (libs.some((l) => l.id === id)) continue;
+      const lib = this.scanner.library(id);
+      if (lib) toScan.push(lib);
+    }
+    for (const lib of toScan) {
       const scan = await this.scanner.scan(lib.id);
       if (scan.unreadable) {
         const msg =
@@ -787,9 +834,11 @@ export class SyncEngine {
     const profile = settings.profile_id ? this.profiles.get(settings.profile_id) ?? null : null;
     this.log.info(
       "sync.start",
-      `Sync (${trigger}) started for ${label}: ${libs.length} folder(s) ` +
-        `(${libs.map((l) => l.name).join(", ")}), profile ${profile ? profile.name : "none"}`,
-      { deviceId, detail: { libraryIds: libs.map((l) => l.id) } },
+      `Sync (${trigger}) started for ${label}: ${libs.length} folder rule(s) ` +
+        `(${libs.map((l) => l.name).join(", ") || "none"})` +
+        (pinned.length ? `, ${pinned.length} sent by hand` : "") +
+        `, profile ${profile ? profile.name : "none"}`,
+      { deviceId, detail: { libraryIds: libs.map((l) => l.id), pinned: pinned.length } },
     );
 
     // 1. what's on the device now
@@ -839,8 +888,10 @@ export class SyncEngine {
       else unmanaged.push(file.path);
     }
 
-    // 3. desired set — everything across all the bound folders
-    const desired = this.books.idsForLibraries(libs.map((l) => l.id));
+    // 3. desired set — every book a folder rule covers, plus every book sent to
+    // this reader by hand. The two are indistinguishable from here on: a sent
+    // book is resampled, stamped, placed and recorded by exactly the same loop.
+    const desired = this.books.idsForDevice(libs.map((l) => l.id), pinned);
     const desiredSet = new Set(desired);
 
     // Where each of them belongs, and which are somewhere else. A book moves
@@ -850,7 +901,7 @@ export class SyncEngine {
     // the old copy after the new one lands. Deliberately *not* counted as a
     // removal: the book stays on the reader, so this must not trip the
     // confirmation rail that exists to catch a folder going missing.
-    const placements = this.placementsFor(libs);
+    const placements = this.placementsFor(libs, pinned);
     const relocations = new Map<string, string>(); // bookId -> where it is now
     for (const [id, current] of presentBooks) {
       if (!desiredSet.has(id)) continue;
@@ -936,21 +987,36 @@ export class SyncEngine {
     let connectionLost = false;
     let stopped = false;
 
+    // Which folders hold each book we are about to send, so the per-book
+    // re-check below can tell "this one book's rule went away" from "there is
+    // nothing left to do at all".
+    const holders = this.books.libraryIdsByBook(toSend);
+
     for (const [index, bookId] of toSend.entries()) {
-      // Sending a large folder takes minutes, and the user can unbind or remove
-      // it while we are mid-transfer. Re-check the binding each book rather than
-      // trusting the one we read at the top of the run.
-      const stillBound = new Set(
+      // Sending a large folder takes minutes, and the user can unbind a rule,
+      // un-send a book or remove a folder while we are mid-transfer. Re-check
+      // each book rather than trusting what we read at the top of the run.
+      const stillRuled = new Set(
         this.scanner.librariesForDevice(deviceId).map((l) => l.id),
       );
-      if (!libs.some((l) => stillBound.has(l.id))) {
+      const stillSent = new Set(this.pins.idsFor(deviceId));
+      if (!stillRuled.size && !stillSent.size) {
         this.log.info(
           "sync.stopped",
-          `Stopped syncing ${label} after ${sent} book(s) — its folders were removed or unbound`,
+          `Stopped syncing ${label} after ${sent} book(s) — its folders and sends were removed`,
           { deviceId, detail: { libraryIds: libs.map((l) => l.id) } },
         );
         stopped = true;
         break;
+      }
+      // One book losing its reason to be here does not invalidate the rest of
+      // the run — which the old whole-run check got wrong in the other
+      // direction, happily finishing a folder the user had just unbound.
+      if (
+        !stillSent.has(bookId) &&
+        ![...(holders.get(bookId) ?? [])].some((id) => stillRuled.has(id))
+      ) {
+        continue;
       }
 
       const book = this.books.get(bookId);

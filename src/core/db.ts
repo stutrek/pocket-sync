@@ -267,8 +267,8 @@ const MIGRATIONS: string[] = [
   ALTER TABLE device_settings ADD COLUMN kosync_at     TEXT;
   `,
 
-  // v5 — a person has several sync servers, and a reader may be pinned to one
-  // of them rather than following its holder's default.
+  // v5 — a person has several sync servers, and a reader may override which one
+  // it uses rather than following its holder's default.
   //
   // NULL is the normal value and means "whoever is holding this reader decides",
   // which is what makes handing a reader over re-point it.
@@ -319,6 +319,38 @@ const MIGRATIONS: string[] = [
     updated_at    TEXT NOT NULL,
     PRIMARY KEY (user_id, document_hash)
   );
+  `,
+
+  // v8 — books sent to one reader by hand, and whether a reader has been set up.
+  //
+  // Sending one book is the primitive; a folder rule automates it. Both end up
+  // in the same desired set, so `device_pin` is unioned into it rather than
+  // being a second delivery path — see `Books.idsForDevice()`. Un-sending drops
+  // the row, the book falls out of the desired set, and the ordinary
+  // reconciliation sweep removes it; that is the only removal mechanism there
+  // is, and a send that could be dropped without the book leaving would be a
+  // lie.
+  //
+  // No `library_id` column. Where a sent book is filed on the reader is derived
+  // from `library_book` at send time, exactly as a rule-covered book's is, so
+  // the two can never disagree after a rename or a move. A book held by several
+  // folders already has a deterministic tiebreak in `sourcePathsFor()`.
+  //
+  // Both cascades are load-bearing: forgetting a reader drops its sends, and
+  // purging a book drops the sends naming it.
+  //
+  // `setup_at` means "the user has looked at this reader once", not "configured
+  // it" — resampling, page sync and the catalog are all pushed automatically.
+  // It is what stops the first-contact card reappearing forever.
+  `
+  CREATE TABLE device_pin (
+    device_id  TEXT NOT NULL REFERENCES device(id) ON DELETE CASCADE,
+    book_id    TEXT NOT NULL REFERENCES book(id)   ON DELETE CASCADE,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (device_id, book_id)
+  );
+  CREATE INDEX device_pin_book_idx ON device_pin(book_id);
+  ALTER TABLE device_settings ADD COLUMN setup_at TEXT;
   `,
 ];
 

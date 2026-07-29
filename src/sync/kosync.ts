@@ -160,7 +160,7 @@ export class KosyncServer {
   }
 
   /**
-   * Where this person's readers report unless one is pinned elsewhere.
+   * Where this person's readers report unless one overrides it.
    *
    * A default pointing at a server that has since been removed falls back to
    * ours rather than returning nothing — the list always has ours in it, so
@@ -263,7 +263,7 @@ export class KosyncServer {
     this.#writeServers(userId, (list) => list.filter((s) => s.id !== serverId));
     const user = this.users.find((u) => u.id === userId);
     if (user?.defaultSyncServerId === serverId) this.setDefaultServer(userId, null);
-    // Readers pinned to it fall back to the holder's default rather than being
+    // Readers overriding to it fall back to the holder's default rather than being
     // left pointing at a server nothing in the app can describe any more.
     this.db.run(
       "UPDATE device_settings SET sync_server_id = NULL WHERE sync_server_id = ?",
@@ -300,7 +300,7 @@ export class KosyncServer {
    * in `src/sync/engine.ts`); this is only the values, so the piece that knows
    * the credentials stays the piece that issues them.
    *
-   * `serverId` pins the reader to one server from the holder's list; omitted or
+   * `serverId` overrides to one server from the holder's list; omitted or
    * unknown, it falls back to their default. An unknown id is not an error
    * because a server can be deleted while a reader is offline.
    */

@@ -16,7 +16,8 @@ import { detectDrm } from "../library/drm.ts";
 import { extOf } from "../library/ingest.ts";
 import { enumerate, knownSources, sourceById, sourcePath } from "../library/sources.ts";
 import type { ReadingFilter } from "../library/books.ts";
-import type { DeviceSettings } from "../sync/engine.ts";
+import { parseScope, resolveScope } from "../library/shelf.ts";
+import { type DeviceSettings, REMOVAL_CONFIRM_THRESHOLD } from "../sync/engine.ts";
 
 type Handler = (
   req: Request,
@@ -43,6 +44,20 @@ const text = (body: string, contentType: string) =>
   });
 
 const notFound = () => json({ error: "not found" }, 404);
+
+/**
+ * `{ bookIds: [...] }` from a body that may be absent — a bulk send with no
+ * body is an empty selection, not a malformed request.
+ */
+async function bodyBookIds(req: Request): Promise<string[]> {
+  try {
+    const body = await req.json();
+    const ids = (body as { bookIds?: unknown }).bookIds;
+    return Array.isArray(ids) ? ids.map(String) : [];
+  } catch {
+    return [];
+  }
+}
 
 /** True when running from a compiled binary rather than `deno run`. */
 function isPackaged(): boolean {
@@ -90,15 +105,34 @@ export function createHandler(
   });
 
   // --- library ---
+  /**
+   * `?scope=all | user:<id> | device:<id>` — what this shelf is *of*.
+   *
+   * The scope decides both which books come back and whose reading progress
+   * rides along, so the client no longer has to work out which person a device
+   * implies and then race its own book fetch to say so.
+   */
   on("GET", "/api/library", (req) => {
     const url = new URL(req.url);
+    const scope = resolveScope(parseScope(url.searchParams.get("scope")), {
+      db: app.db,
+      books: app.books,
+      scanner: app.scanner,
+      pins: app.pins,
+      users: app.config.current.users,
+      holderOf: (deviceId) => app.sync.settings(deviceId).user_id,
+    });
     const books = app.books.list({
       query: url.searchParams.get("query") ?? undefined,
       libraryId: url.searchParams.get("library") || undefined,
-      userId: url.searchParams.get("user") || app.config.current.users[0]?.id,
+      libraryIds: scope.libraryIds,
+      includeBookIds: scope.includeBookIds,
+      userId: scope.userId,
       reading: (url.searchParams.get("reading") as ReadingFilter) || undefined,
     });
     // Per-device state is a control in the UI, not a count, so send the ids.
+    // Both relations, because "on it" and "why it is on it" are different
+    // questions and the card has to answer the second to offer an un-send.
     const onDevices = new Map<string, string[]>();
     for (
       const row of app.db.all<{ book_id: string; device_id: string }>(
@@ -109,10 +143,17 @@ export function createHandler(
       if (list) list.push(row.device_id);
       else onDevices.set(row.book_id, [row.device_id]);
     }
+    const pinnedTo = new Map<string, string[]>();
+    for (const { bookId, deviceId } of app.pins.all()) {
+      const list = pinnedTo.get(bookId);
+      if (list) list.push(deviceId);
+      else pinnedTo.set(bookId, [deviceId]);
+    }
     return json(books.map((b) => ({
       ...b,
       hasCover: !!b.cover_path,
       onDevices: onDevices.get(b.id) ?? [],
+      pinnedTo: pinnedTo.get(b.id) ?? [],
     })));
   });
 
@@ -171,6 +212,11 @@ export function createHandler(
       libraries,
       reading,
       devices,
+      // Which readers were told to take this book by hand, as opposed to
+      // carrying it because a folder rule covers it. The drawer needs the
+      // difference: a rule-covered row must not offer an un-send that would
+      // silently do nothing.
+      pinnedTo: app.pins.devicesFor(book.id),
     });
   });
 
@@ -566,6 +612,36 @@ export function createHandler(
 
   on("PUT", "/api/libraries/:id", async (req, p) => {
     const patch = await req.json();
+    const before = app.config.current.libraries.find((l) => l.id === p.id);
+
+    /**
+     * Dropping a folder rule is the ambiguous removal, so it is the one that
+     * asks.
+     *
+     * Un-sending a book never asks — the user pointed at that book and said
+     * take it off. Deleting a rule is a single click that can clear a hundred
+     * books, and the reader is usually not even awake to show it happening, so
+     * the count is computed *before* the config is written and the whole
+     * request is refused rather than half-applied.
+     */
+    const confirmed = !!new URL(req.url).searchParams.get("confirmRemovals");
+    if (before && Array.isArray(patch.deviceIds) && !confirmed) {
+      const next = new Set(patch.deviceIds.map(String));
+      for (const deviceId of before.deviceIds.filter((d) => !next.has(d))) {
+        const keep = app.scanner.librariesForDevice(deviceId)
+          .filter((l) => l.id !== p.id)
+          .map((l) => l.id);
+        const desired = new Set(app.books.idsForDevice(keep, app.pins.idsFor(deviceId)));
+        const losing = app.db.all<{ book_id: string }>(
+          "SELECT book_id FROM device_content WHERE device_id = ?",
+          deviceId,
+        ).filter((r) => !desired.has(r.book_id)).length;
+        if (losing > REMOVAL_CONFIRM_THRESHOLD) {
+          return json({ error: "confirm_removals", deviceId, removing: losing }, 409);
+        }
+      }
+    }
+
     // Many-to-many: binding a device to this folder leaves its other folders
     // alone. Only this folder's list changes.
     const libraries = app.config.current.libraries.map((l) =>
@@ -581,6 +657,27 @@ export function createHandler(
     );
     app.config.update({ libraries });
     app.scanner.restart();
+
+    /**
+     * Act on the rule now, not at the reader's next connect.
+     *
+     * A rule is the automation of sending a book, and sending a book syncs
+     * immediately — a rule that visibly does nothing until the reader happens to
+     * reconnect reads as broken, and a reader that is already awake never fires
+     * `onDeviceConnected` again. Fired and not awaited, like the send routes:
+     * the single-flight guard collapses a burst of rule edits into one run plus
+     * at most one rerun.
+     *
+     * Every device on either side of the change, so dropping a rule takes its
+     * books off as promptly as adding one puts them on. `confirmRemovals`
+     * because the 409 above already asked.
+     */
+    if (before && Array.isArray(patch.deviceIds)) {
+      const touched = new Set([...before.deviceIds, ...patch.deviceIds.map(String)]);
+      for (const deviceId of touched) {
+        app.sync.sync(deviceId, "manual", { confirmRemovals: true }).catch(() => {});
+      }
+    }
     return json(librariesView().find((l) => l.id === p.id) ?? {});
   });
 
@@ -881,6 +978,7 @@ export function createHandler(
         ...d,
         settings: app.sync.settings(d.id),
         libraryIds: app.scanner.librariesForDevice(d.id).map((l) => l.id),
+        pinnedBookIds: app.pins.idsFor(d.id),
         plan: app.sync.plan(d.id),
         contentCount: app.db.get<{ n: number }>(
           "SELECT COUNT(*) AS n FROM device_content WHERE device_id = ?",
@@ -991,6 +1089,46 @@ export function createHandler(
     const confirm = !!new URL(req.url).searchParams.get("confirmRemovals");
     return json(await app.sync.sync(p.id, "manual", { confirmRemovals: confirm }));
   });
+
+  /**
+   * Send books to one reader by hand — the primitive interaction, of which a
+   * folder rule is the automation.
+   *
+   * The sync is fired and not awaited: uploading takes minutes and the button
+   * that called this should come back immediately. A burst of sends collapses
+   * into one run plus at most one rerun (`#running`/`#rerun` in the engine), so
+   * ticking twelve books does not queue twelve syncs.
+   *
+   * `confirmRemovals` is set because the user just said what they wanted. The
+   * bulk-removal rail exists to catch a folder going missing, not to
+   * second-guess an explicit instruction — without this, un-sending six books
+   * would trip a guard and wait for a confirmation of the thing already
+   * confirmed.
+   */
+  const sendRoute =
+    (method: "PUT" | "DELETE") => async (req: Request, p: Record<string, string>) => {
+      const device = app.devices.row(p.id);
+      if (!device) return notFound();
+      const bookIds = p.bookId ? [p.bookId] : await bodyBookIds(req);
+      const unknown = bookIds.filter((id) => !app.books.get(id));
+      if (unknown.length) return json({ error: `unknown book: ${unknown[0]}` }, 404);
+
+      if (method === "PUT") app.pins.add(p.id, bookIds);
+      else app.pins.remove(p.id, bookIds);
+
+      app.sync.sync(p.id, "manual", { confirmRemovals: true }).catch(() => {});
+      return json({
+        sent: method === "PUT",
+        online: app.devices.view().find((d) => d.id === p.id)?.state.online ?? false,
+        plan: app.sync.plan(p.id),
+      });
+    };
+
+  on("PUT", "/api/devices/:id/pins/:bookId", sendRoute("PUT"));
+  on("DELETE", "/api/devices/:id/pins/:bookId", sendRoute("DELETE"));
+  // Bulk forms, so selecting twelve books is one request and one sync.
+  on("PUT", "/api/devices/:id/pins", sendRoute("PUT"));
+  on("DELETE", "/api/devices/:id/pins", sendRoute("DELETE"));
 
   // --- profiles ---
   on("GET", "/api/profiles", () => json(app.profiles.all()));

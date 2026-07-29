@@ -11,8 +11,8 @@ uses the long-press action. There is no auto-sync on open or close — `launchKO
 called from exactly those two places in the firmware.
 
 The reader also keeps its position on its own SD card, and that file is readable **and writable**
-over the HTTP API we already use. Everything below was verified against a real X3 on
-`1.4.0-tiny`, and cross-checked against the firmware source
+over the HTTP API we already use. Everything below was verified against a real X3 on `1.4.0-tiny`,
+and cross-checked against the firmware source
 ([crosspoint-reader/crosspoint-reader](https://github.com/crosspoint-reader/crosspoint-reader),
 `develop`).
 
@@ -44,11 +44,11 @@ the `device_content.device_path` we recorded, not off the md5 and not off a name
 
 ## progress.bin — six bytes, three little-endian uint16
 
-| Offset | Field                         |
-| ------ | ----------------------------- |
-| 0      | `currentSpineIndex`           |
+| Offset | Field                                          |
+| ------ | ---------------------------------------------- |
+| 0      | `currentSpineIndex`                            |
 | 2      | `nextPageNumber` — page within that spine item |
-| 4      | `cachedChapterTotalPageCount` |
+| 4      | `cachedChapterTotalPageCount`                  |
 
 `EpubReaderActivity::onEnter` accepts a read of **4 or 6 bytes** (4 = pre-total-page-count files),
 and treats `nextPageNumber == 0xFFFF` as an in-memory "open previous chapter at its last page"
@@ -111,29 +111,29 @@ The reader's own sync client sends a **rich position** to servers it recognises 
 `pctQ`, `spineIndex`, `pageNumber`, `totalPages`, `paragraphIndex`, `xpath`
 (`lib/KOReaderSync/KOReaderSyncClient.h`). We already store the whole payload verbatim in
 `reading_state.position_json` and echo `position` back on `GET /syncs/progress/{document}`, so when
-the reader pulls, *it* does the remapping with the layout knowledge we lack. Preserving that payload
+the reader pulls, _it_ does the remapping with the layout knowledge we lack. Preserving that payload
 untouched is what makes CrossPoint↔CrossPoint sync lossless — don't reduce it to a percentage.
 
 ## Other on-device files worth knowing
 
 Under `/.crosspoint/`:
 
-| File                     | Contents                                                                 |
-| ------------------------ | ------------------------------------------------------------------------ |
-| `state.json`             | `openEpubPath`, pending bookmark fields, sleep-screen state              |
-| `recent.json`            | recents: `path`, `title`, `author`, `coverBmpPath` — a free path→book map |
-| `koreader.json`          | `username`, `password_obf`, `serverUrl`, `matchMethod` — what the reader was actually told |
-| `settings.json` / `crossink-settings.json` | the flat settings the firmware persists                |
-| `global_stats.bin`, `<book>/stats_v5.bin`  | reading-time stats (format not decoded)                |
-| `<book>/book.bin`        | parsed metadata cache — `\xffCXB` magic, then title/author/cover href    |
+| File                                       | Contents                                                                                   |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------ |
+| `state.json`                               | `openEpubPath`, pending bookmark fields, sleep-screen state                                |
+| `recent.json`                              | recents: `path`, `title`, `author`, `coverBmpPath` — a free path→book map                  |
+| `koreader.json`                            | `username`, `password_obf`, `serverUrl`, `matchMethod` — what the reader was actually told |
+| `settings.json` / `crossink-settings.json` | the flat settings the firmware persists                                                    |
+| `global_stats.bin`, `<book>/stats_v5.bin`  | reading-time stats (format not decoded)                                                    |
+| `<book>/book.bin`                          | parsed metadata cache — `\xffCXB` magic, then title/author/cover href                      |
 
 `recent.json` is the cheapest way to check our path→hash derivation on a live device: every entry
 carries both the path and the `epub_<id>` it maps to.
 
 ## Two settings `configureReader()` does not write
 
-Both are real settings keys (`src/SettingsList.h`), so they go through the same
-`POST /api/settings` partial-body write as the `ko*` block:
+Both are real settings keys (`src/SettingsList.h`), so they go through the same `POST /api/settings`
+partial-body write as the `ko*` block:
 
 - `koSyncBehavior` — `0` = ask every time, `1` = **smart** (compares timestamps and acts without
   prompting). Smart makes the user's tap a single action with no dialog.

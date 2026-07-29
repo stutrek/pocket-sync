@@ -983,5 +983,104 @@ print(len(theirs) == 1 and theirs[0]['url'] == 'https://standardebooks.org/feeds
 [ "$KEPT" = "True" ] && ok "a catalog the user added themselves is left alone" \
                      || bad "we trampled another catalog: $(cat "$WORK/device.opds.json")"
 
+step "22. Sending one book by hand"
+# The primitive interaction: one book, one reader, no folder rule involved. A
+# folder rule is the automation of this, not the other way round.
+LOOSE2="$BOOKROOT/byhand"
+mkdir -p "$LOOSE2"
+# Written fresh rather than copied from the shelf: earlier steps deliberately
+# delete files there to exercise the removal rails.
+python3 -c "
+para = ('A paragraph long enough to force the CrossPoint text splitter to do real work, '
+        'repeated so the file comfortably exceeds the split limit. ') * 12
+open('$LOOSE2/Test Author - Hotel.txt', 'w').write('Hotel\n\n' + para + '\n\n' + para)
+"
+HANDLIB=$(curl -sS -X POST -H 'content-type: application/json' \
+  -d '{"name":"By Hand","relPath":"byhand"}' "$API/api/libraries" \
+  | jqp "print(json.load(sys.stdin)['id'])")
+curl -sS -X POST "$API/api/libraries/$HANDLIB/scan" >/dev/null
+wait_idle
+HOTEL=$(curl -sS "$API/api/library" | jqp "
+books = json.load(sys.stdin)
+print(next(b['id'] for b in books if 'Hotel' in b['title']))")
+
+BEFORE=$(device_epubs)
+curl -sS -X PUT "$API/api/devices/$DEVICE_ID/pins/$HOTEL" >/dev/null
+wait_idle
+sync_now >/dev/null
+AFTER=$(device_epubs)
+[ "$AFTER" = "$((BEFORE + 1))" ] && ok "a book with no folder rule reaches the reader when sent" \
+  || bad "expected $((BEFORE + 1)) books on the reader, found $AFTER"
+
+# Not at the upload root. A sent book is filed under its own folder's name, so
+# adding a rule for that folder later moves nothing.
+PLACED=$(device_find "*Hotel*.epub")
+case "$PLACED" in
+  *"/By Hand/"*) ok "a sent book is filed under its own folder, not at the root" ;;
+  *) bad "sent book landed at $PLACED" ;;
+esac
+
+# Adding the rule afterwards must not relocate it — that is the whole reason
+# placement ignores whether a rule covers the folder.
+curl -sS -X PUT -H 'content-type: application/json' \
+  -d "{\"deviceIds\":[\"$DEVICE_ID\"]}" "$API/api/libraries/$HANDLIB" >/dev/null
+wait_idle
+sync_now >/dev/null
+STILL=$(device_find "*Hotel*.epub")
+[ "$STILL" = "$PLACED" ] && ok "adding a folder rule later does not move the book" \
+  || bad "the book moved from $PLACED to $STILL"
+
+# A rule-covered book stays when un-sent: the rule is still putting it there.
+curl -sS -X DELETE "$API/api/devices/$DEVICE_ID/pins/$HOTEL" >/dev/null
+wait_idle
+sync_now >/dev/null
+[ -n "$(device_find "*Hotel*.epub")" ] && ok "un-sending a rule-covered book leaves it alone" \
+  || bad "un-sending removed a book a folder rule still covers"
+
+# With the rule gone and no send, it goes.
+curl -sS -X PUT -H 'content-type: application/json' -d '{"deviceIds":[]}' \
+  "$API/api/libraries/$HANDLIB" >/dev/null
+wait_idle
+sync_now >/dev/null
+[ -z "$(device_find "*Hotel*.epub")" ] && ok "with no rule and no send, the book comes off" \
+  || bad "the book survived losing both its rule and its send"
+
+step "23. A send dies with its file"
+curl -sS -X PUT "$API/api/devices/$DEVICE_ID/pins/$HOTEL" >/dev/null
+wait_idle
+sync_now >/dev/null
+[ -n "$(device_find "*Hotel*.epub")" ] || bad "the re-sent book never arrived"
+rm -f "$LOOSE2/Test Author - Hotel.txt"
+curl -sS -X POST "$API/api/libraries/$HANDLIB/scan" >/dev/null
+wait_idle
+sync_now >/dev/null
+[ -z "$(device_find "*Hotel*.epub")" ] && ok "deleting the source file takes the sent book off" \
+  || bad "a sent book outlived its source file"
+curl -sS -X DELETE "$API/api/libraries/$HANDLIB" >/dev/null
+rm -rf "$LOOSE2"
+
+step "24. Scopes show their own contents"
+# A reader's shelf is what that reader carries plus what a rule feeds it — not
+# the whole library with different annotations, which is what it used to be.
+ALLBOOKS=$(curl -sS "$API/api/library?scope=all" | jqp "print(len(json.load(sys.stdin)))")
+DEVBOOKS=$(curl -sS "$API/api/library?scope=device:$DEVICE_ID" \
+  | jqp "print(len(json.load(sys.stdin)))")
+[ "$DEVBOOKS" -le "$ALLBOOKS" ] && [ "$DEVBOOKS" -gt 0 ] \
+  && ok "the reader's shelf is its own books ($DEVBOOKS of $ALLBOOKS)" \
+  || bad "reader scope returned $DEVBOOKS books against a library of $ALLBOOKS"
+
+# Provenance travels with the row, so a card can tell "a rule put it there" from
+# "you sent it" — and only offer to undo the second.
+ANY_ID=$(curl -sS "$API/api/library?scope=all" | jqp "print(json.load(sys.stdin)[0]['id'])")
+curl -sS -X PUT "$API/api/devices/$DEVICE_ID/pins/$ANY_ID" >/dev/null
+PINNED=$(curl -sS "$API/api/library?scope=device:$DEVICE_ID" | jqp "
+books = json.load(sys.stdin)
+row = next(b for b in books if b['id'] == '$ANY_ID')
+print('$DEVICE_ID' in row['pinnedTo'])")
+[ "$PINNED" = "True" ] && ok "the shelf says which books were sent by hand" \
+  || bad "pinnedTo did not come back on the shelf row"
+curl -sS -X DELETE "$API/api/devices/$DEVICE_ID/pins/$ANY_ID" >/dev/null
+wait_idle
+
 printf '\n\033[1m%d passed, %d failed\033[0m  (logs in %s)\n' "$pass" "$fail" "$WORK"
 [ "$fail" = "0" ]

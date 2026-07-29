@@ -138,12 +138,16 @@ export class Scanner {
     staleJobs: number;
     purgedBooks: number;
     orphanDirs: number;
+    deadPins: number;
   } {
     const known = new Set(this.libraries.map((l) => l.id));
     const placeholder = known.size ? [...known].map(() => "?").join(",") : "''";
     const args = known.size ? [...known] : [];
 
     let orphanRows = 0;
+    // `device_pin` is deliberately not in this list: it sweeps by `library_id`,
+    // and a send names a reader and a book, never a folder. Its own sweep is
+    // below, keyed on the book having left the library entirely.
     for (const table of ["library_book", "file_index", "import_job"]) {
       const doomed = this.db.get<{ n: number }>(
         `SELECT COUNT(*) AS n FROM ${table} WHERE library_id NOT IN (${placeholder})`,
@@ -165,28 +169,42 @@ export class Scanner {
     )!.n;
     if (staleJobs) this.db.run("DELETE FROM import_job WHERE state = 'running'");
 
+    // A send is an instruction about a file. Once no folder holds that file
+    // there is nothing to send and nothing to un-send, so the row goes — the
+    // same rule the desired-set query applies live, repeated here to clear the
+    // rows themselves rather than just ignore them.
+    const deadPins = this.db.get<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM device_pin WHERE book_id NOT IN (SELECT book_id FROM library_book)",
+    )!.n;
+    if (deadPins) {
+      this.db.run(
+        "DELETE FROM device_pin WHERE book_id NOT IN (SELECT book_id FROM library_book)",
+      );
+    }
+
     // Books no folder holds and no device carries: their derived artifacts are
     // dead weight on disk. Reading state is keyed separately and deliberately
     // survives, so re-adding the file restores where you were.
     const stranded = this.db.all<{ id: string }>(
       `SELECT id FROM book
        WHERE id NOT IN (SELECT book_id FROM library_book)
-         AND id NOT IN (SELECT book_id FROM device_content)`,
+         AND id NOT IN (SELECT book_id FROM device_content)
+         AND id NOT IN (SELECT book_id FROM device_pin)`,
     );
     for (const row of stranded) this.books.purge(row.id);
 
     const orphanDirs = this.#sweepArtifacts();
 
-    if (orphanRows || staleJobs || stranded.length || orphanDirs) {
+    if (orphanRows || staleJobs || stranded.length || orphanDirs || deadPins) {
       this.log.info(
         "index.reconciled",
         `Cleaned the index: ${orphanRows} row(s) for folders no longer watched, ` +
           `${staleJobs} interrupted import(s), ${stranded.length} unreferenced book(s), ` +
-          `${orphanDirs} leftover artifact folder(s)`,
-        { detail: { orphanRows, staleJobs, purgedBooks: stranded.length, orphanDirs } },
+          `${orphanDirs} leftover artifact folder(s), ${deadPins} send(s) for missing files`,
+        { detail: { orphanRows, staleJobs, purgedBooks: stranded.length, orphanDirs, deadPins } },
       );
     }
-    return { orphanRows, staleJobs, purgedBooks: stranded.length, orphanDirs };
+    return { orphanRows, staleJobs, purgedBooks: stranded.length, orphanDirs, deadPins };
   }
 
   /**

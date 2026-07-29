@@ -14,19 +14,19 @@ conversion) and the CrossPoint plugin's Python optimizer (device-correct EPUB/im
 
 ## Where things live
 
-| Path           | Concern                                                                                                                   |
-| -------------- | ------------------------------------------------------------------------------------------------------------------------- |
-| `src/main.ts`  | Entrypoint. Two HTTP listeners, then deferred tray/window startup                                                         |
-| `src/app.ts`   | Object graph + dependency probing. No GUI imports — headless-safe                                                         |
-| `src/core/`    | `config.ts`, `db.ts` (schema + migrations), `hash.ts`, `log.ts`, `events.ts`, `ids.ts`, `paths.ts`, `net.ts`              |
-| `src/library/` | `scanner.ts` (watched folders), `ingest.ts`, `drm.ts`, `calibre.ts`, `imports.ts`, `books.ts`                             |
-| `src/device/`  | `client.ts` (device HTTP API), `manager.ts` (discovery, registry, identity)                                               |
-| `src/sync/`    | `profiles.ts` (resample cache), `engine.ts` (reconciliation), `reading.ts`, `kosync.ts`                                   |
-| `src/engine/`  | `sidecar.ts` (supervises Python), `runtime.ts` (bundled CPython), `assets.ts` (embedded engine files)                     |
-| `src/web/`     | `server.ts` (REST + SSE), `opds.ts` (catalog + its listener), `ui/` (Preact sources), `static/` (HTML shell + bundled JS) |
-| `src/desktop/` | `shell.ts` (tray + window), `autostart.ts` (start at login)                                                               |
-| `engine/`      | `sidecar.py` (ours) + `vendor/crosspoint_reader/` (upstream, unmodified)                                                  |
-| `tests/`       | `unit_test.ts`, `fake_device.ts`, `acceptance.sh`                                                                         |
+| Path           | Concern                                                                                                                    |
+| -------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `src/main.ts`  | Entrypoint. Two HTTP listeners, then deferred tray/window startup                                                          |
+| `src/app.ts`   | Object graph + dependency probing. No GUI imports — headless-safe                                                          |
+| `src/core/`    | `config.ts`, `db.ts` (schema + migrations), `hash.ts`, `log.ts`, `events.ts`, `ids.ts`, `paths.ts`, `net.ts`               |
+| `src/library/` | `scanner.ts` (watched folders), `ingest.ts`, `drm.ts`, `calibre.ts`, `imports.ts`, `books.ts`, `shelf.ts` (scope resolver) |
+| `src/device/`  | `client.ts` (device HTTP API), `manager.ts` (discovery, registry, identity)                                                |
+| `src/sync/`    | `profiles.ts` (resample cache), `engine.ts` (reconciliation), `pins.ts` (books sent by hand), `reading.ts`, `kosync.ts`    |
+| `src/engine/`  | `sidecar.ts` (supervises Python), `runtime.ts` (bundled CPython), `assets.ts` (embedded engine files)                      |
+| `src/web/`     | `server.ts` (REST + SSE), `opds.ts` (catalog + its listener), `ui/` (Preact sources), `static/` (HTML shell + bundled JS)  |
+| `src/desktop/` | `shell.ts` (tray + window), `autostart.ts` (start at login)                                                                |
+| `engine/`      | `sidecar.py` (ours) + `vendor/crosspoint_reader/` (upstream, unmodified)                                                   |
+| `tests/`       | `unit_test.ts`, `fake_device.ts`, `acceptance.sh`                                                                          |
 
 Related skills: `pocket-run` (running/debugging), `pocket-test` (verifying changes),
 `pocket-device-protocol` (device + vendored engine), `pocket-reading-position` (positions on the
@@ -39,7 +39,7 @@ watched folder → scan (md5 keyed on path/size/mtime) → detect DRM → [calib
        → ebook-meta → convert to book.epub → SQLite index row
 device connects (UDP discovery or manual host) → /api/status → identity + model
        → POST /api/settings points its KOReader Sync client at the holder's sync server
-       → /api/files walked → desired set = the bound folder → diff both ways
+       → /api/files walked → desired = folder rules ∪ books sent by hand → diff both ways
        → per book: optimize (cached) → stamp source md5 → WebSocket upload ≤2048 B frames
        → device_content manifest updated → events to UI/tray
 reader taps "Sync Progress" → kosync listener → document hash → book → reading_state
@@ -80,24 +80,27 @@ reader taps "Sync Progress" → kosync listener → document hash → book → r
    as separate books. Kindle is deliberately not a source — its current DRM cannot be removed by any
    available tool (docs/DESIGN.md); don't re-add it.
 5. **Folders and devices are many-to-many, and reading state keys on the _user_.** A device's
-   desired set is the union of its folders (`idsForLibraries`), and one unavailable folder aborts
-   the whole sync. A "user" is a name in config with no login; `device_settings.user_id` says who is
-   holding a reader, and `reading_state` / `kosync_user` are keyed by that — never by folder, and
-   never by the device name the firmware reports. It follows that a reader nobody is holding is
-   never configured for page sync (`configureReader()`): the only credentials it could be given
-   would be somebody else's, and every report it made would land on their shelf.
+   desired set is `Books.idsForDevice(libraryIds, pinnedIds)` — the union of its folder rules and
+   the books sent to it by hand (invariant 17) — and one unavailable folder aborts the whole sync,
+   including a folder that only a sent book lives in. A "user" is a name in config with no login;
+   `device_settings.user_id` says who is holding a reader, and `reading_state` / `kosync_user` are
+   keyed by that — never by folder, and never by the device name the firmware reports. It follows
+   that a reader nobody is holding is never configured for page sync (`configureReader()`): the only
+   credentials it could be given would be somebody else's, and every report it made would land on
+   their shelf.
 
    **Sync servers hang off the user too.** Each person has a list (`UserConfig.syncServers`) with
-   one default; a reader reports to `device_settings.sync_server_id` if pinned, else to its holder's
-   default — which is what makes handing a reader over re-point it. Ours is _synthetic_
-   (`LOCAL_SYNC_SERVER_ID`, always first, resolved live by `KosyncServer.servers()`), never stored:
-   its URL is this machine's LAN address and its credentials are generated, so a frozen copy in
-   `config.json` would rot silently. A reader found pointing at a server that is **not already on
-   the holder's list** is _adopted_ — copied into that list, pinned, and left alone. "Not already on
-   the list" is the test, not "we never configured this reader": get that wrong and adoption repeats
-   forever, and no pin change ever reaches the device. Anything that changes what a reader was told
-   (holder, pin, default, our port) must clear `kosync_hash`, or the fingerprint short-circuit
-   suppresses the push.
+   one default; a reader reports to `device_settings.sync_server_id` if it **overrides**, else to
+   its holder's default — which is what makes handing a reader over re-point it. (Say "override",
+   not "pinned": _pinned_ now means a book sent to a reader by hand, and the two concepts sit two
+   fields apart.) Ours is _synthetic_ (`LOCAL_SYNC_SERVER_ID`, always first, resolved live by
+   `KosyncServer.servers()`), never stored: its URL is this machine's LAN address and its
+   credentials are generated, so a frozen copy in `config.json` would rot silently. A reader found
+   pointing at a server that is **not already on the holder's list** is _adopted_ — copied into that
+   list, overridden to it, and left alone. "Not already on the list" is the test, not "we never
+   configured this reader": get that wrong and adoption repeats forever, and no override change ever
+   reaches the device. Anything that changes what a reader was told (holder, override, default, our
+   port) must clear `kosync_hash`, or the fingerprint short-circuit suppresses the push.
 6. **Resampling defaults to the device's model** (`defaultProfileFor()`), backfilled at startup.
    "None" must stay a deliberate choice: unoptimized books are the likeliest way to crash the
    firmware.
@@ -164,6 +167,12 @@ reader taps "Sync Progress" → kosync listener → document hash → book → r
     `REMOVAL_CONFIRM_THRESHOLD` (5) removals needs `confirmRemovals`. Relatedly, a scan already in
     progress returns the real result to every caller — never a zero-filled placeholder, which the
     engine would read as "delete everything".
+
+    **The confirmation belongs to the ambiguous action, not to every removal.** Un-sending a book
+    passes `confirmRemovals` — the user pointed at that book and said take it off, and a rail that
+    argues is noise. Dropping a folder rule is the click that can clear a hundred books off a reader
+    that is not even awake, so `PUT /api/libraries/:id` computes the loss **before** writing
+    anything and answers `409 confirm_removals`. Compute-then-write, never write-then-roll-back.
 12. **Schedulers fix their interval at `start()`.** `DeviceManager` and `Scanner` both capture the
     cadence when armed, so a settings change touching `discovery` or `scan` must call `restart()` —
     otherwise `discoveryStatus()` reports a cadence the app is not keeping. Discovery sweeps
@@ -174,21 +183,49 @@ reader taps "Sync Progress" → kosync listener → document hash → book → r
     no restart — call it from anywhere that writes them. `OpdsServer.applyConfig()` is the same
     contract for `config.opds`.
 13. **The index self-heals at startup.** `Scanner.reconcile()` removes rows for unconfigured
-    folders, stale `running` jobs, unreferenced books and orphaned artifact directories. Anything
-    new that keys off `library_id` or writes under `library/<md5>/` should be swept there too, or it
-    leaks silently.
+    folders, stale `running` jobs, unreferenced books, orphaned artifact directories, and sends
+    whose book has left every folder. Anything new that keys off `library_id` or writes under
+    `library/<md5>/` should be swept there too, or it leaks silently. Note `device_pin` is **not**
+    in the `library_id` table list: a send names a reader and a book and has no folder, so it gets
+    its own sweep — and it has to be excluded from the stranded-book purge or the purge deletes the
+    books it protects.
 14. **Long-running work must be cancellable.** Importing or syncing a big folder takes minutes and
     the user can remove the folder meanwhile. `Scanner.forget()` is called before the rows are
     deleted, the scan loop bails between files and purges what it added, and the sync loop re-checks
-    the device's binding each book. Adding a new long loop over a library means adding the same
-    check.
+    each book against the rules and sends still in force — per book, so one book losing its reason
+    to be there skips that book rather than abandoning the run. Adding a new long loop over a
+    library means adding the same check.
 15. **Never edit `engine/vendor/`.** See `pocket-device-protocol`.
 16. **Chunk size is capped at 2048 bytes** by the firmware. The config allows less, never more.
+17. **Sending one book is the primitive; a folder rule automates it.** A send is a `device_pin` row
+    (`src/sync/pins.ts`) unioned into the desired set, never a second delivery path — so it is
+    resampled, stamped and hash-mapped by the same loop as everything else. Consequences that are
+    each easy to get wrong:
+
+    - **Un-send is a removal**, because reconciliation is the only removal there is. A send that
+      could be dropped without the book leaving would be a lie. It follows that un-sending a book a
+      folder rule still covers does nothing — which the UI must render as a state, not a control.
+    - **A send dies with its file.** `idsForDevice` requires a surviving `library_book` row, so the
+      rule bites on the next sync rather than the next `reconcile()`.
+    - **A sent book from an unruled folder still mirrors that folder.** `placementsFor()` builds its
+      folder-name lookup from **every** configured folder and only _prefers_ the ruled ones when a
+      book sits in several. Scope that lookup to the ruled folders and sent books land at the upload
+      root, where every folder name lives — and adding the rule later then relocates every one of
+      them, which on this firmware is send-then-delete.
+    - **A rule must act now.** The send routes and `PUT /api/libraries/:id` both fire a sync without
+      awaiting it; a reader that is already awake never fires `onDeviceConnected` again, so without
+      this a new rule appears to do nothing.
+18. **A scope resolves to its own contents.** `resolveScope()` in `src/library/shelf.ts` turns
+    `all | user:<id> | device:<id>` into folder ids, extra book ids and the progress owner. It
+    cannot be a join: the folder→device rule lives in `config.json`, not SQLite. `Books.list()` is
+    therefore driven `FROM book LEFT JOIN library_book` — a book on a reader whose file has left
+    every watched folder has no `library_book` row at all, so `library_id`/`path` are **nullable**
+    and that state gets its own group on the shelf rather than being dropped.
 
 ## Testing expectations
 
 Any change touching the scanner, ingest, optimization, the device client or the sync engine should
-keep `deno task acceptance` green (68 checks) — it runs against a simulated reader and unpacks the
+keep `deno task acceptance` green (76 checks) — it runs against a simulated reader and unpacks the
 delivered EPUBs to check they are genuinely device-safe. It binds port 8899 and aborts if that is
 taken, so it can never drive a running `deno task dev` against your real library. See `pocket-test`.
 
