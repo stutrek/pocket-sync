@@ -29,7 +29,8 @@ conversion) and the CrossPoint plugin's Python optimizer (device-correct EPUB/im
 | `tests/`       | `unit_test.ts`, `fake_device.ts`, `acceptance.sh`                                                                         |
 
 Related skills: `pocket-run` (running/debugging), `pocket-test` (verifying changes),
-`pocket-device-protocol` (device + vendored engine), `pocket-package` (distributables).
+`pocket-device-protocol` (device + vendored engine), `pocket-reading-position` (positions on the
+reader's own card), `pocket-package` (distributables).
 
 ## Data flow
 

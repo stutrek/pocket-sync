@@ -180,6 +180,11 @@ sent, and their positions are kept against the hash alone in `unmapped_progress`
 Anything that answers `PUT /syncs/progress` with a shrug shows up on the device as page sync being
 broken, because the reader is answered either way and only finds out when it reads back nothing.
 
+The reader keeps its own copy of the position on the SD card, under `/.crosspoint/epub_<hash>/`, and
+that file is readable and writable through `/api/files`, `/download` and `PUT` — which is the only
+way to move a position without the user tapping Sync. Format, hash derivation and what is safe to
+write back are in `pocket-reading-position`.
+
 ### WebSocket upload — `ws://<host>:<port>/`
 
 1. text `START:<filename>:<size>:<path>` (`<path>` = target **directory**)
